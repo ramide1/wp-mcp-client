@@ -31,8 +31,9 @@ mcp-servers.json
 *.tsbuildinfo
 
 # IntelliJ based IDEs
-.idea
+ .idea
 
 # Finder (MacOS) folder config
-.DS_Store
+ .DS_Store
 auth
+*.sqlite
