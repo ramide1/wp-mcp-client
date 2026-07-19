@@ -7,14 +7,14 @@ const tokenOpenaiApi: string = process.env.TOKEN_OPENAI_API ?? '';
 const tokenOpenaiAudioApi: string = process.env.TOKEN_OPENAI_AUDIO_API ?? tokenOpenaiApi;
 const urlBaseOpenaiApi: string = process.env.URL_BASE_OPENAI_API ?? 'https://api.openai.com/v1/chat/completions';
 const urlBaseOpenaiAudioApi: string = process.env.URL_BASE_OPENAI_AUDIO_API ?? '';
-const modeloApiAudioOpenai: string = process.env.MODEL_API_AUDIO_OPENAI ?? '';
-const modeloApiOpenai: string = process.env.MODEL_API_OPENAI ?? 'gpt-4o';
-const modeloSoportaImagen: boolean = ((process.env.MODEL_SUPPORTS_IMAGE !== undefined) && (process.env.MODEL_SUPPORTS_IMAGE == 'true')) ? true : false;
-const limiteTokensOpenai: number = parseInt(process.env.LIMIT_TOKENS_OPENAI ?? '2000');
-const limiteFetch: number = parseInt(process.env.LIMIT_FETCH ?? '3');
-const limiteTiempo: number = parseInt(process.env.LIMIT_TIME ?? '5') * 1000;
-const limiteHerramientas: number = parseInt(process.env.LIMIT_TOOLS ?? '10');
-const usuariosAdministradores: string[] = ((process.env.ADMIN_USERS !== undefined) && (process.env.ADMIN_USERS.includes(', '))) ? process.env.ADMIN_USERS.trim().split(', ') : ((process.env.ADMIN_USERS !== undefined) ? [process.env.ADMIN_USERS.trim()] : []);
+const modelApiAudioOpenai: string = process.env.MODEL_API_AUDIO_OPENAI ?? '';
+const modelApiOpenai: string = process.env.MODEL_API_OPENAI ?? 'gpt-4o';
+const modelSupportsImage: boolean = ((process.env.MODEL_SUPPORTS_IMAGE !== undefined) && (process.env.MODEL_SUPPORTS_IMAGE == 'true')) ? true : false;
+const limitTokensOpenai: number = parseInt(process.env.LIMIT_TOKENS_OPENAI ?? '2000');
+const limitFetch: number = parseInt(process.env.LIMIT_FETCH ?? '3');
+const limitTime: number = parseInt(process.env.LIMIT_TIME ?? '5') * 1000;
+const limitTools: number = parseInt(process.env.LIMIT_TOOLS ?? '10');
+const adminUsers: string[] = ((process.env.ADMIN_USERS !== undefined) && (process.env.ADMIN_USERS.includes(', '))) ? process.env.ADMIN_USERS.trim().split(', ') : ((process.env.ADMIN_USERS !== undefined) ? [process.env.ADMIN_USERS.trim()] : []);
 
 interface PuppeterConfig {
     args?: string[];
@@ -32,20 +32,20 @@ const puppeteer: PuppeterConfig = {
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
     headless: true
 };
-const navegador: string = process.env.BROWSER ?? '';
+const browser: string = process.env.BROWSER ?? '';
 
-if (navegador !== '') {
+if (browser !== '') {
     puppeteer.chrome = {
         skipDownload: true
     };
     puppeteer.firefox = {
         skipDownload: true
     };
-    puppeteer.executablePath = navegador;
+    puppeteer.executablePath = browser;
 }
 
-const sesiones: Map<string, boolean> = new Map<string, boolean>();
-const prueba: boolean = ((process.env.TEST_MODE !== undefined) && (process.env.TEST_MODE == 'true')) ? true : false;
+const sessions: Map<string, boolean> = new Map<string, boolean>();
+const testMode: boolean = ((process.env.TEST_MODE !== undefined) && (process.env.TEST_MODE == 'true')) ? true : false;
 
 const client = new Client({
     puppeteer,
@@ -69,7 +69,7 @@ const adminTools: any[] = [
         type: 'function',
         function: {
             name: 'clean_chat',
-            description: 'Clear message history for a specific user (only the following users can do this: ' + usuariosAdministradores.join(', ') + ' )',
+            description: 'Clear message history for a specific user (only the following users can do this: ' + adminUsers.join(', ') + ' )',
             parameters: {
                 type: 'object',
                 properties: {
@@ -86,19 +86,19 @@ const adminTools: any[] = [
         type: 'function',
         function: {
             name: 'clean_all_chats',
-            description: 'Clear message history for all users (only the following users can do this: ' + usuariosAdministradores.join(', ') + ' )'
+            description: 'Clear message history for all users (only the following users can do this: ' + adminUsers.join(', ') + ' )'
         }
     }
 ];
 
-const instructionsFile: string = (process.env.INSTRUCTIONS !== undefined) ? process.env.INSTRUCTIONS : 'instrucciones.txt';
+const instructionsFile: string = (process.env.INSTRUCTIONS !== undefined) ? process.env.INSTRUCTIONS : 'instructions.txt';
 const instructionsFileContent: string = existsSync(instructionsFile) ? readFileSync(instructionsFile, 'utf8') : '';
 const instructions: string = ((instructionsFileContent !== '') ? instructionsFileContent : 'You are an assistant') + `
 \n\nCONFIRMATION INSTRUCTIONS:\n
 - Do NOT use 'functions' unless the client confirms or says EXPLICITLY: 'yes I confirm', 'I want to confirm' or similar\n
 - ALWAYS ask: 'Do you want to confirm?' before using the function.\n`;
 
-const limpiarChatsActual = async (user: string) => {
+const cleanCurrentChat = async (user: string) => {
     try {
         if (!resetHistory(user)) throw new Error('Error clearing message history');
         return 'Message history cleared successfully';
@@ -107,7 +107,7 @@ const limpiarChatsActual = async (user: string) => {
     }
 };
 
-const limpiarChats = async (user: string) => {
+const cleanChat = async (user: string) => {
     try {
         if (!resetHistory(user)) throw new Error('Error clearing message history for ' + user);
         return 'Message history for ' + user + ' cleared successfully';
@@ -116,7 +116,7 @@ const limpiarChats = async (user: string) => {
     }
 };
 
-const limpiarChatsTodos = async () => {
+const cleanAllChats = async () => {
     try {
         if (!resetAllHistory()) throw new Error('Error clearing all message history');
         return 'All message history cleared successfully';
@@ -127,12 +127,12 @@ const limpiarChatsTodos = async () => {
 
 const functionAttempts = async (functionAttempt: any) => {
     let attempts: number = 0;
-    while (attempts < limiteFetch) {
+    while (attempts < limitFetch) {
         try {
             return await functionAttempt();
         } catch (error: any) {
             attempts++;
-            if (attempts < limiteFetch) await new Promise(resolve => setTimeout(resolve, limiteTiempo));
+            if (attempts < limitFetch) await new Promise(resolve => setTimeout(resolve, limitTime));
         }
     }
     return false;
@@ -168,13 +168,13 @@ client.on('message_create', async (message: Message) => {
     let media: MessageMedia | null = null;
     if (message.hasMedia) media = await message.downloadMedia();
     const currentChat: Chat = await message.getChat();
-    if ((!prueba && message.fromMe) || currentChat.isGroup || message.isStatus || (message.to === message.from) || (!media && messageText === '')) return;
+    if ((!testMode && message.fromMe) || currentChat.isGroup || message.isStatus || (message.to === message.from) || (!media && messageText === '')) return;
     const contact: any = await client.getContactLidAndPhone([message.from]);
     const user: string = contact?.[0]?.pn ?? message.from.split('@')[0];
-    const sesionActual: number | boolean = sesiones.get(user) ?? false;
+    const currentSession: number | boolean = sessions.get(user) ?? false;
     try {
-        if (sesionActual) throw new Error('Responding to previous message. Please wait before sending a new message');
-        sesiones.set(user, true);
+        if (currentSession) throw new Error('Responding to previous message. Please wait before sending a new message');
+        sessions.set(user, true);
         if (media && !(media.mimetype.startsWith('audio/') || media.mimetype.startsWith('image/'))) throw new Error('Unsupported attachment, only images and audio in flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, or webm format are accepted');
         const userHistory: any[] = loadHistory(user);
         const messages: any[] = [{ role: 'system', content: instructions + 'The current user is ' + user + " \n\n" + 'The current date in ISO String format is ' + toIsoString((new Date())) + "\n\n" + 'NEVER show the ID field to the user as it is sensitive information' + "\n\n" }];
@@ -208,7 +208,7 @@ client.on('message_create', async (message: Message) => {
             } else {
                 formData.append('file', audioData)
             }
-            formData.append('model', modeloApiAudioOpenai);
+            formData.append('model', modelApiAudioOpenai);
             formData.append('language', 'en');
             formData.append('prompt', 'Transcribe the audio');
             formData.append('response_format', 'json');
@@ -232,7 +232,7 @@ client.on('message_create', async (message: Message) => {
                 text: audioData.text
             });
             saveHistory(user, 'user', audioData.text, '', '');
-        } else if (media && media.mimetype.startsWith('image/') && modeloSoportaImagen) {
+        } else if (media && media.mimetype.startsWith('image/') && modelSupportsImage) {
             content.push({
                 type: 'image_url',
                 image_url: {
@@ -243,12 +243,12 @@ client.on('message_create', async (message: Message) => {
         if (content.length === 0) return;
         messages.push({ role: 'user', content });
 
-        const currentTools: any[] = usuariosAdministradores.includes(user) ? adminTools : tools;
+        const currentTools: any[] = adminUsers.includes(user) ? adminTools : tools;
         let currentIteration: number = 0,
             finalResponseContent: string | null = null,
             toolCalled: string | null = null;
 
-        while (currentIteration < limiteHerramientas) {
+        while (currentIteration < limitTools) {
             currentIteration++;
             let data: any = null;
 
@@ -260,11 +260,11 @@ client.on('message_create', async (message: Message) => {
                         'Authorization': 'Bearer ' + tokenOpenaiApi
                     },
                     body: JSON.stringify({
-                        model: modeloApiOpenai,
+                        model: modelApiOpenai,
                         messages,
                         tools: currentTools,
                         tool_choice: 'auto',
-                        max_completion_tokens: limiteTokensOpenai
+                        max_completion_tokens: limitTokensOpenai
                     })
                 });
                 if (!response.ok) throw new Error();
@@ -272,11 +272,7 @@ client.on('message_create', async (message: Message) => {
                 if (!data || (data.error && data.error.message && data.error.message.startsWith('Rate limit reached for model'))) throw new Error();
             });
 
-            if (toolCalled) {
-                resetHistory(user);
-                if (!data || data.error || !data.choices) throw new Error(toolCalled);
-            }
-            if (!data || data.error || !data.choices) throw new Error('Failed response. Please try again in a few seconds');
+            if (!data || data.error || !data.choices) throw new Error(toolCalled ?? 'Failed response. Please try again in a few seconds');
             const aiMessage: any = data.choices[0].message ?? null;
             if (!aiMessage) throw new Error('Failed response. Please try again in a few seconds');
             const toolCalls: any[] = aiMessage.tool_calls ?? [];
@@ -295,12 +291,12 @@ client.on('message_create', async (message: Message) => {
                 const functionArgs: any = JSON.parse(toolCall.function.arguments) ?? null;
                 let functionResponse: string = 'Failed function response';
                 if (functionName == 'clean_current_chat') {
-                    functionResponse = await limpiarChatsActual(user);
-                } else if (usuariosAdministradores.includes(user)) {
+                    functionResponse = await cleanCurrentChat(user);
+                } else if (adminUsers.includes(user)) {
                     if (functionName == 'clean_chat') {
-                        functionResponse = await limpiarChats(functionArgs.user);
+                        functionResponse = await cleanChat(functionArgs.user);
                     } else if (functionName == 'clean_all_chats') {
-                        functionResponse = await limpiarChatsTodos();
+                        functionResponse = await cleanAllChats();
                     }
                 }
                 messages.push({
@@ -323,11 +319,11 @@ client.on('message_create', async (message: Message) => {
             await client.sendMessage(message.from, finalResponseContent);
         }
     } catch (error: any) {
-        if (prueba) console.error(error);
+        if (testMode) console.error(error);
         saveHistory(user, 'assistant', error.message, '', '');
         await client.sendMessage(message.from, error.message);
     }
-    if (!sesionActual) sesiones.delete(user);
+    if (!currentSession) sessions.delete(user);
 });
 
 client.initialize();
