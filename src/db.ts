@@ -4,6 +4,7 @@ import path from 'path';
 
 const connections: Map<string, Database> = new Map<string, Database>();
 const appSqliteDatabase: string = process.env.SQLITE_DATABASE ?? 'db.sqlite';
+const maxHistory: number = parseInt(process.env.LIMIT_HISTORY ?? '100');
 
 const getDb = () => {
     if (!connections.has(appSqliteDatabase)) {
@@ -24,16 +25,19 @@ const saveHistory = (user: string, role: string, textContent: string, toolCallId
     const query: any = db.query('INSERT INTO chat_history (user, role, text_content, tool_call_id, function_name) VALUES (?, ?, ?, ?, ?)');
     try {
         query.run(user, role, textContent, toolCallId, functionName);
+        const trimQuery: any = db.query('DELETE FROM chat_history WHERE user = ? AND id NOT IN (SELECT id FROM chat_history WHERE user = ? ORDER BY id DESC LIMIT ?)');
+        trimQuery.run(user, user, maxHistory);
         return true;
     } catch (error: any) {
+        console.error('Error saving history:', error.message);
         return false;
     }
 };
 
 const loadHistory = (user: string) => {
     const db: Database = getDb();
-    const query: any = db.query('SELECT * FROM chat_history WHERE user = ?');
-    return query.all(user) ?? [];
+    const query: any = db.query('SELECT * FROM chat_history WHERE user = ? ORDER BY id ASC LIMIT ?');
+    return query.all(user, maxHistory) ?? [];
 };
 
 const resetHistory = (user: string) => {

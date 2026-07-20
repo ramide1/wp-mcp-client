@@ -5,10 +5,16 @@ import type { MCPConfig, MCPServerConfig, ToolSearchResult } from './interface';
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 
+// Tool name delimiter: used to separate serverName from toolName in MCP tool names
+// Using :: to avoid ambiguity with tools that contain underscores in their names
+const TOOL_NAME_DELIMITER = '::';
+
 export class MCPClientManager {
   private clients: Map<string, Client> = new Map();
+  private connectingServers: Map<string, Promise<void>> = new Map(); // Track in-flight connections
   private config: MCPConfig = { servers: [] };
   private toolCache: Map<string, any> = new Map(); // Cache for tool definitions
+  private toolCacheTimestamps: Map<string, number> = new Map(); // Track when entries were added
   private configPath: string;
   // Track last used time for each server to implement idle timeout
   private serverLastUsed: Map<string, number> = new Map();
@@ -25,7 +31,7 @@ export class MCPClientManager {
   }
 
   /**
-   * Start the idle cleanup timer to disconnect unused servers
+   * Start the idle cleanup timer to disconnect unused servers and evict expired cache entries
    */
   private startIdleCleanup(): void {
     // Clear existing timer if any
@@ -33,10 +39,35 @@ export class MCPClientManager {
       clearInterval(this.idleCleanupTimer);
     }
 
-    // Check for idle servers every minute
+    // Check for idle servers and expired cache every minute
     this.idleCleanupTimer = setInterval(() => {
       this.disconnectIdleServers();
+      this.evictExpiredCache();
     }, 60 * 1000); // Check every minute
+  }
+
+  /**
+   * Evict cache entries that have exceeded the TTL (5 minutes)
+   */
+  private evictExpiredCache(): void {
+    const now = Date.now();
+    const TTL_MS = 5 * 60 * 1000;
+    const keysToDelete: string[] = [];
+
+    for (const [key, timestamp] of this.toolCacheTimestamps.entries()) {
+      if (now - timestamp > TTL_MS) {
+        keysToDelete.push(key);
+      }
+    }
+
+    for (const key of keysToDelete) {
+      this.toolCache.delete(key);
+      this.toolCacheTimestamps.delete(key);
+    }
+
+    if (keysToDelete.length > 0) {
+      console.log(`Evicted ${keysToDelete.length} expired cache entries`);
+    }
   }
 
   /**
@@ -58,8 +89,11 @@ export class MCPClientManager {
 
     // Disconnect idle servers
     for (const serverName of serversToDisconnect) {
-      this.disconnectServer(serverName);
-      console.log(`Disconnected idle MCP server: ${serverName}`);
+      this.disconnectServer(serverName).then(() => {
+        console.log(`Disconnected idle MCP server: ${serverName}`);
+      }).catch(error => {
+        console.error(`Error disconnecting idle MCP server ${serverName}:`, error);
+      });
     }
   }
 
@@ -82,10 +116,26 @@ export class MCPClientManager {
     this.serverLastUsed.delete(serverName);
 
     // Clear cache entries for this server
+    this.invalidateServerCache(serverName);
+  }
+
+  /**
+   * Invalidate all cache entries for a specific server
+   * Called when tools/list_changed notification is received
+   */
+  private invalidateServerCache(serverName: string): void {
+    const keysToDelete: string[] = [];
     for (const [key] of this.toolCache.entries()) {
       if (key.startsWith(`${serverName}:`)) {
-        this.toolCache.delete(key);
+        keysToDelete.push(key);
       }
+    }
+    for (const key of keysToDelete) {
+      this.toolCache.delete(key);
+      this.toolCacheTimestamps.delete(key);
+    }
+    if (keysToDelete.length > 0) {
+      console.log(`Invalidated ${keysToDelete.length} cache entries for server ${serverName}`);
     }
   }
 
@@ -116,17 +166,37 @@ export class MCPClientManager {
 
     // Clear tool cache when reconnecting
     this.toolCache.clear();
+    this.toolCacheTimestamps.clear();
 
     // Note: We no longer automatically connect to all enabled servers on startup
     // Instead, connections are established on-demand when tools are requested
     // This implements dynamic server management as per MCP best practices
+
+    // Restart idle cleanup timer (disconnectAll clears it)
+    this.startIdleCleanup();
   }
 
   private async connectServer(serverConfig: MCPServerConfig): Promise<void> {
-    const client = new Client({
-      name: `mcp-client-${serverConfig.name}`,
-      version: '1.0.0'
-    });
+    const client = new Client(
+      { name: `mcp-client-${serverConfig.name}`, version: '1.0.0' },
+      {
+        // Handle tools/list_changed notifications from the server
+        // This invalidates the tool cache when the server's tool list changes
+        listChanged: {
+          tools: {
+            onChanged: (error, tools) => {
+              if (error) {
+                console.error(`Error receiving tools/list_changed from ${serverConfig.name}:`, error);
+                return;
+              }
+              console.log(`Tools list changed on server ${serverConfig.name}, refreshing cache...`);
+              // Invalidate cache for this server
+              this.invalidateServerCache(serverConfig.name);
+            }
+          }
+        }
+      }
+    );
 
     let transport;
 
@@ -154,11 +224,6 @@ export class MCPClientManager {
 
     await client.connect(transport);
     this.clients.set(serverConfig.name, client);
-
-    // Set up listeners for notifications
-    // TODO: Implement proper notification handling for tools/list_changed
-    // This requires accessing the underlying transport or using client-specific methods
-    // For now, we'll rely on periodic cache refresh
   }
 
   public async disconnectAll(): Promise<void> {
@@ -178,6 +243,7 @@ export class MCPClientManager {
     }
     this.clients.clear();
     this.serverLastUsed.clear();
+    this.connectingServers.clear();
   }
 
   public getClient(serverName: string): Client | undefined {
@@ -191,7 +257,8 @@ export class MCPClientManager {
   }
 
   /**
-   * Ensure a server is connected, connecting it if necessary
+   * Ensure a server is connected, connecting it if necessary.
+   * Concurrent calls for the same server will wait for the in-flight connection.
    * @param serverName Name of the server to ensure is connected
    */
   public async ensureServerConnected(serverName: string): Promise<void> {
@@ -199,6 +266,17 @@ export class MCPClientManager {
     if (this.clients.has(serverName)) {
       this.serverLastUsed.set(serverName, Date.now());
       return;
+    }
+
+    // If a connection is already in progress, wait for it
+    const inFlight = this.connectingServers.get(serverName);
+    if (inFlight) {
+      await inFlight;
+      // After waiting, check again in case the connection succeeded
+      if (this.clients.has(serverName)) {
+        this.serverLastUsed.set(serverName, Date.now());
+        return;
+      }
     }
 
     // Find the server configuration
@@ -211,8 +289,13 @@ export class MCPClientManager {
       throw new Error(`MCP server is disabled: ${serverName}`);
     }
 
-    // Connect to the server
-    await this.connectServer(serverConfig);
+    // Track the in-flight connection
+    const connectPromise = this.connectServer(serverConfig).finally(() => {
+      this.connectingServers.delete(serverName);
+    });
+    this.connectingServers.set(serverName, connectPromise);
+
+    await connectPromise;
 
     // Mark as recently used
     this.serverLastUsed.set(serverName, Date.now());
@@ -262,8 +345,7 @@ export class MCPClientManager {
         // Ensure we're connected to this server
         await this.ensureServerConnected(serverName);
 
-        const client = this.getClient(serverName);
-        if (!client) continue;
+        const client = this.getClient(serverName)!; // Guaranteed to exist after ensureServerConnected
 
         // Check cache first
         const cacheKey = `${serverName}:tools`;
@@ -273,11 +355,9 @@ export class MCPClientManager {
           toolsResponse = this.toolCache.get(cacheKey);
         } else {
           toolsResponse = await client.listTools();
-          // Cache the results for 5 minutes
+          // Cache the results (evicted by interval-based TTL)
           this.toolCache.set(cacheKey, toolsResponse);
-          setTimeout(() => {
-            this.toolCache.delete(cacheKey);
-          }, 5 * 60 * 1000);
+          this.toolCacheTimestamps.set(cacheKey, Date.now());
         }
 
         // Enhanced search with token matching and basic scoring
@@ -362,6 +442,7 @@ export class MCPClientManager {
    * @returns Full tool definition including input/output schemas
    */
   public async getToolDetails(serverName: string, toolName: string): Promise<any> {
+    await this.ensureServerConnected(serverName);
     const client = this.getClient(serverName);
     if (!client) {
       throw new Error(`MCP client for server ${serverName} not found`);
@@ -381,11 +462,9 @@ export class MCPClientManager {
         throw new Error(`Tool ${toolName} not found on server ${serverName}`);
       }
 
-      // Cache the tool details
+      // Cache the tool details (evicted by interval-based TTL)
       this.toolCache.set(cacheKey, tool);
-      setTimeout(() => {
-        this.toolCache.delete(cacheKey);
-      }, 5 * 60 * 1000); // 5 minutes
+      this.toolCacheTimestamps.set(cacheKey, Date.now());
 
       return tool;
     } catch (error) {
@@ -402,6 +481,7 @@ export class MCPClientManager {
    * @returns Tool execution result
    */
   public async callTool(serverName: string, toolName: string, args: any): Promise<any> {
+    await this.ensureServerConnected(serverName);
     const client = this.getClient(serverName);
     if (!client) {
       throw new Error(`MCP client for server ${serverName} not found`);
@@ -421,5 +501,33 @@ export class MCPClientManager {
   public async refreshConfig(): Promise<void> {
     await this.disconnectAll();
     await this.initialize();
+  }
+
+  /**
+   * Get the full tool name with server prefix using the delimiter
+   * @param serverName Name of the server
+   * @param toolName Name of the tool
+   * @returns Full tool name in format "serverName::toolName"
+   */
+  public static getFullToolName(serverName: string, toolName: string): string {
+    return `${serverName}${TOOL_NAME_DELIMITER}${toolName}`;
+  }
+
+  /**
+   * Parse a full tool name into server name and tool name
+   * @param fullToolName Full tool name in format "serverName::toolName"
+   * @returns Object with serverName and toolName, or null if parsing fails
+   */
+  public static parseToolName(fullToolName: string): { serverName: string; toolName: string } | null {
+    const delimiterIndex = fullToolName.indexOf(TOOL_NAME_DELIMITER);
+    if (delimiterIndex === -1) {
+      return null;
+    }
+    const serverName = fullToolName.substring(0, delimiterIndex);
+    const toolName = fullToolName.substring(delimiterIndex + TOOL_NAME_DELIMITER.length);
+    if (serverName && toolName) {
+      return { serverName, toolName };
+    }
+    return null;
   }
 }

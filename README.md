@@ -7,12 +7,14 @@ A WhatsApp bot that integrates with Model Context Protocol (MCP) servers, allowi
 - WhatsApp integration using whatsapp-web.js
 - MCP client support for connecting to local and remote MCP servers
 - Environment-based configuration
-- Support for both stdio and SSE/HTTP MCP server transports
-- Progressive tool discovery with search capability
-- Automatic tool discovery and execution
+- Support for both stdio and StreamableHTTP MCP server transports
+- Progressive tool discovery with search and inspection capability
+- Programmatic tool calling via `execute_tool_sequence` for multi-step operations
+- Dynamic server management: on-demand connections with idle timeout (5 min)
+- Tool cache with interval-based TTL eviction
 - Configurable AI model integration (OpenAI by default)
 - Admin controls for privileged users
-- Message history persistence
+- Message history persistence (SQLite)
 
 ## Installation
 
@@ -52,6 +54,7 @@ Then edit the `.env` file to configure your settings:
 | `LIMIT_FETCH` | Number of retry attempts for API calls | `3` |
 | `LIMIT_TIME` | Delay between retries in seconds | `5` |
 | `LIMIT_TOOLS` | Maximum tool call iterations per message | `10` |
+| `LIMIT_HISTORY` | Maximum messages per user in database | `100` |
 | `ADMIN_USERS` | Comma-separated list of admin phone numbers | (empty) |
 | `BROWSER` | Path to browser executable for Puppeteer | (empty) |
 | `TEST_MODE` | Enable test mode (reduces logging) | `false` |
@@ -83,7 +86,7 @@ Each server object supports:
 - `args`: Arguments for the command (for stdio)
 - `env`: Environment variables (for stdio)
 - `url`: Server URL (for sse)
-- `enabled`: Whether to connect to this server on startup
+- `enabled`: Whether this server can be connected (servers connect on-demand when tools are needed)
 
 ## Usage
 
@@ -115,16 +118,19 @@ When you send a message to the bot:
 - `clean_current_chat`: Clears the message history for the current user
 - `clean_chat` (admin only): Clears message history for a specific user
 - `clean_all_chats` (admin only): Clears message history for all users
-- `search_tools`: Search for available tools across all connected MCP servers
+- `search_tools`: Search for available tools across all connected MCP servers by name/description
+- `get_tool_details`: Get full schema and documentation for a specific tool
+- `execute_tool_sequence`: Execute a sequence of MCP tool calls efficiently in a single pass, with support for chaining results between steps
 
 ## MCP Integration
 
 This implementation follows the Model Context Protocol (MCP) specification and best practices as outlined in the [MCP documentation](https://modelcontextprotocol.io/docs/develop/build-client) and [MCP client best practices](https://modelcontextprotocol.io/docs/develop/clients/client-best-practices):
-- Uses progressive tool discovery with a `search_tools` function for finding relevant tools
-- Implements tool caching to minimize redundant requests
-- Properly handles tool execution results and errors according to MCP specification
-- Supports both stdio and HTTP/SSE transports
-- Maintains proper client lifecycle management
+- Progressive tool discovery with `search_tools` and `get_tool_details` for finding and inspecting tools
+- Programmatic tool calling via `execute_tool_sequence` for chaining multiple tool calls without passing intermediate results through the model
+- Dynamic server management: servers connected on-demand, disconnected after 5 min idle
+- Tool cache with interval-based TTL (5 min) and invalidation on `tools/list_changed` notifications
+- Properly handles MCP tool responses including `isError` flags per specification
+- Supports both stdio and StreamableHTTP transports
 
 ## Requirements
 

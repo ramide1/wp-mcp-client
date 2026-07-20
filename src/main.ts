@@ -9,13 +9,14 @@ const tokenOpenaiAudioApi: string = process.env.TOKEN_OPENAI_AUDIO_API ?? tokenO
 const urlBaseOpenaiApi: string = process.env.URL_BASE_OPENAI_API ?? 'https://api.openai.com/v1/chat/completions';
 const urlBaseOpenaiAudioApi: string = process.env.URL_BASE_OPENAI_AUDIO_API ?? '';
 const modelApiAudioOpenai: string = process.env.MODEL_API_AUDIO_OPENAI ?? '';
+const audioLanguage: string = process.env.AUDIO_LANGUAGE ?? 'en';
 const modelApiOpenai: string = process.env.MODEL_API_OPENAI ?? 'gpt-4o';
-const modelSupportsImage: boolean = ((process.env.MODEL_SUPPORTS_IMAGE !== undefined) && (process.env.MODEL_SUPPORTS_IMAGE == 'true')) ? true : false;
+const modelSupportsImage: boolean = process.env.MODEL_SUPPORTS_IMAGE === 'true';
 const limitTokensOpenai: number = parseInt(process.env.LIMIT_TOKENS_OPENAI ?? '2000');
 const limitFetch: number = parseInt(process.env.LIMIT_FETCH ?? '3');
 const limitTime: number = parseInt(process.env.LIMIT_TIME ?? '5') * 1000;
 const limitTools: number = parseInt(process.env.LIMIT_TOOLS ?? '10');
-const adminUsers: string[] = ((process.env.ADMIN_USERS !== undefined) && (process.env.ADMIN_USERS.includes(', '))) ? process.env.ADMIN_USERS.trim().split(', ') : ((process.env.ADMIN_USERS !== undefined) ? [process.env.ADMIN_USERS.trim()] : []);
+const adminUsers: string[] = (process.env.ADMIN_USERS ?? '').split(/,\s*/).map(u => u.trim()).filter(u => u.length > 0);
 
 interface PuppeterConfig {
     args?: string[];
@@ -46,7 +47,7 @@ if (browser !== '') {
 }
 
 const sessions: Map<string, boolean> = new Map<string, boolean>();
-const testMode: boolean = ((process.env.TEST_MODE !== undefined) && (process.env.TEST_MODE == 'true')) ? true : false;
+const testMode: boolean = process.env.TEST_MODE === 'true';
 const mcpClientManager = new MCPClientManager();
 
 const client = new Client({
@@ -104,6 +105,53 @@ const tools: any[] = [
                     }
                 },
                 required: ['serverName', 'toolName']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'execute_tool_sequence',
+            description: 'Execute a sequence of MCP tool calls efficiently in a single pass. Use this when you need to call multiple tools that don\'t depend on each other, or when you want to chain tools without passing intermediate results through the conversation. Returns only the final summary.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    steps: {
+                        type: 'array',
+                        description: 'Array of tool calls to execute sequentially',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                serverName: {
+                                    type: 'string',
+                                    description: 'Name of the MCP server'
+                                },
+                                toolName: {
+                                    type: 'string',
+                                    description: 'Name of the tool to call'
+                                },
+                                args: {
+                                    type: 'object',
+                                    description: 'Arguments to pass to the tool'
+                                },
+                                saveAs: {
+                                    type: 'string',
+                                    description: 'Variable name to save result for use in later steps (optional)'
+                                },
+                                useResultFrom: {
+                                    type: 'string',
+                                    description: 'Variable name whose result to use as the args for this step (optional)'
+                                }
+                            },
+                            required: ['serverName', 'toolName']
+                        }
+                    },
+                    summary: {
+                        type: 'string',
+                        description: 'A prompt describing what final summary to produce from the results'
+                    }
+                },
+                required: ['steps', 'summary']
             }
         }
     }
@@ -260,7 +308,7 @@ client.on('message_create', async (message: Message) => {
                 formData.append('file', audioData)
             }
             formData.append('model', modelApiAudioOpenai);
-            formData.append('language', 'en');
+            formData.append('language', audioLanguage);
             formData.append('prompt', 'Transcribe the audio');
             formData.append('response_format', 'json');
             audioResponse = null;
@@ -327,7 +375,10 @@ client.on('message_create', async (message: Message) => {
             if (!aiMessage) throw new Error('Failed response. Please try again in a few seconds');
             const toolCalls: any[] = aiMessage.tool_calls ?? [];
 
-            saveHistory(user, 'assistant', aiMessage.content, '', '');
+            // Only save to history if assistant has content (skip when only tool calls)
+            if (aiMessage.content) {
+                saveHistory(user, 'assistant', aiMessage.content, '', '');
+            }
             messages.push(aiMessage);
 
             if (toolCalls.length === 0) {
@@ -338,8 +389,20 @@ client.on('message_create', async (message: Message) => {
 
             for (const toolCall of toolCalls) {
                 const functionName: string = toolCall.function.name ?? '';
-                const functionArgs: any = JSON.parse(toolCall.function.arguments) ?? null;
                 let functionResponse: string = 'Failed function response';
+                let functionArgs: any = null;
+                try {
+                    functionArgs = JSON.parse(toolCall.function.arguments);
+                } catch {
+                    functionResponse = `Error: Invalid JSON in tool arguments for ${functionName}`;
+                    messages.push({
+                        tool_call_id: toolCall.id,
+                        role: 'tool',
+                        name: functionName,
+                        content: functionResponse
+                    });
+                    continue;
+                }
 
                 // Handle search_tools function
                 if (functionName === 'search_tools') {
@@ -348,13 +411,13 @@ client.on('message_create', async (message: Message) => {
                         const limit = functionArgs?.limit ?? 10;
                         const searchResults = await mcpClientManager.searchTools(query, limit);
 
-                        // Format results for the LLM
+                        // Format results for the LLM using the new delimiter
                         let resultText = 'Search results:\n';
                         if (searchResults.length === 0) {
                             resultText += 'No tools found matching the query.';
                         } else {
                             for (const result of searchResults) {
-                                resultText += `- ${result.serverName}_${result.toolName}: ${result.description}\n`;
+                                resultText += `- ${MCPClientManager.getFullToolName(result.serverName, result.toolName)}: ${result.description}\n`;
                             }
                         }
                         functionResponse = resultText;
@@ -375,6 +438,7 @@ client.on('message_create', async (message: Message) => {
                             let resultText = `Tool Details:\n`;
                             resultText += `Server: ${toolDetails.serverName || serverName}\n`;
                             resultText += `Name: ${toolDetails.name}\n`;
+                            resultText += `Full Name: ${MCPClientManager.getFullToolName(serverName, toolDetails.name)}\n`;
                             resultText += `Description: ${toolDetails.description || 'No description available'}\n`;
                             if (toolDetails.inputSchema) {
                                 resultText += `Input Schema: ${JSON.stringify(toolDetails.inputSchema, null, 2)}\n`;
@@ -392,31 +456,47 @@ client.on('message_create', async (message: Message) => {
                         functionResponse = `Error getting tool details: ${error instanceof Error ? error.message : String(error)}`;
                     }
                 }
-                // Check if this is an MCP tool (prefixed with server name)
-                else {
-                    const mcpToolMatch = functionName.match(/^(.+?)_(.+)$/);
-                    if (mcpToolMatch) {
-                        const [, serverNameMatch, toolNameMatch] = mcpToolMatch;
-                        if (serverNameMatch && toolNameMatch) {
-                            const serverName = serverNameMatch;
-                            const toolName = toolNameMatch;
-                            const client = mcpClientManager.getClient(serverName);
-                            if (client) {
-                                let result;
-                                try {
-                                    result = await mcpClientManager.callTool(serverName, toolName, functionArgs);
-                                } catch (error) {
-                                    // Transport or connection error
-                                    const errorMessage = error instanceof Error ? error.message : String(error);
-                                    functionResponse = `Error calling MCP tool ${toolName}: ${errorMessage}`;
-                                }
+                // Handle execute_tool_sequence (programmatic tool calling)
+                else if (functionName === 'execute_tool_sequence') {
+                    try {
+                        const steps = functionArgs?.steps ?? [];
+                        const summaryPrompt = functionArgs?.summary ?? 'Summarize the results';
+                        const results: Record<string, any> = {};
+                        const stepOutputs: string[] = [];
+                        let successCount = 0;
+                        let errorCount = 0;
 
-                                // Check if tool execution resulted in an error (per MCP spec)
+                        for (let i = 0; i < steps.length; i++) {
+                            const step = steps[i];
+
+                            // Validate step is an object with required fields
+                            if (!step || typeof step !== 'object') {
+                                stepOutputs.push(`Step ${i + 1}: Error - step must be an object`);
+                                errorCount++;
+                                continue;
+                            }
+
+                            const { serverName, toolName, args, saveAs, useResultFrom } = step;
+
+                            if (!serverName || !toolName) {
+                                stepOutputs.push(`Step ${i + 1}: Error - serverName and toolName are required`);
+                                errorCount++;
+                                continue;
+                            }
+
+                            // Resolve arguments: use saved result if useResultFrom is specified
+                            let resolvedArgs = args ?? {};
+                            if (useResultFrom && results[useResultFrom]) {
+                                resolvedArgs = results[useResultFrom];
+                            }
+
+                            try {
+                                const result = await mcpClientManager.callTool(serverName, toolName, resolvedArgs);
+
+                                // Check for MCP error response
                                 if (result && typeof result === 'object' && 'isError' in result && result.isError) {
-                                    // Extract error information from result
                                     let errorMessage = 'Tool execution failed';
                                     if (result.content && Array.isArray(result.content)) {
-                                        // Try to get text content from error result
                                         for (const content of result.content) {
                                             if (content.type === 'text') {
                                                 errorMessage = content.text;
@@ -424,46 +504,120 @@ client.on('message_create', async (message: Message) => {
                                             }
                                         }
                                     }
-                                    // If we couldn't get text content, fall back to stringifying
-                                    if (errorMessage === 'Tool execution failed') {
-                                        errorMessage = JSON.stringify(result);
-                                    }
-                                    functionResponse = `Error from tool ${toolName}: ${errorMessage}`;
+                                    stepOutputs.push(`Step ${i + 1} (${serverName}::${toolName}): Error - ${errorMessage}`);
+                                    errorCount++;
                                 } else {
-                                    // Successful tool execution - extract text content
+                                    // Extract text content
                                     let textContent = '';
                                     if (result && result.content && Array.isArray(result.content)) {
                                         for (const content of result.content) {
                                             if (content.type === 'text') {
-                                                textContent += content.text + '\n';
-                                            }
-                                            // For other content types, we could handle them differently
-                                            // For now, we'll just note their presence
-                                            else if (content.type === 'image' || content.type === 'audio') {
-                                                textContent += `[${content.type} content not displayed in text chat]\n`;
-                                            }
-                                            else if (content.type === 'resource') {
-                                                const res = content.resource as any;
-                                                textContent += `[Resource: ${res.uri || 'unknown'}]\n`;
+                                                textContent += content.text;
                                             }
                                         }
                                     }
+                                    if (!textContent) textContent = JSON.stringify(result);
 
-                                    // Remove trailing newline
-                                    textContent = textContent.trimEnd();
-
-                                    // If no text content found, fall back to stringifying
-                                    if (textContent === '') {
-                                        textContent = JSON.stringify(result);
+                                    // Save result if saveAs is specified
+                                    if (saveAs) {
+                                        results[saveAs] = textContent;
                                     }
-
-                                    functionResponse = textContent;
+                                    stepOutputs.push(`Step ${i + 1} (${serverName}::${toolName}): ${textContent.substring(0, 200)}${textContent.length > 200 ? '...' : ''}`);
+                                    successCount++;
                                 }
-                            } else {
-                                functionResponse = `MCP client for server ${serverName} not found`;
+                            } catch (error) {
+                                const errorMessage = error instanceof Error ? error.message : String(error);
+                                stepOutputs.push(`Step ${i + 1} (${serverName}::${toolName}): Error - ${errorMessage}`);
+                                errorCount++;
                             }
+                        }
+
+                        // Generate actual summary from results
+                        const summaryLines: string[] = [];
+                        summaryLines.push(`Tool sequence completed: ${successCount} succeeded, ${errorCount} failed out of ${steps.length} steps.`);
+                        summaryLines.push('');
+                        summaryLines.push('Step details:');
+                        summaryLines.push(stepOutputs.join('\n'));
+
+                        if (Object.keys(results).length > 0) {
+                            summaryLines.push('');
+                            summaryLines.push('Saved results:');
+                            for (const [key, value] of Object.entries(results)) {
+                                const preview = typeof value === 'string' ? value.substring(0, 100) : JSON.stringify(value).substring(0, 100);
+                                summaryLines.push(`  ${key}: ${preview}${preview.length >= 100 ? '...' : ''}`);
+                            }
+                        }
+
+                        summaryLines.push('');
+                        summaryLines.push(`Request: ${summaryPrompt}`);
+
+                        functionResponse = summaryLines.join('\n');
+                    } catch (error) {
+                        functionResponse = `Error executing tool sequence: ${error instanceof Error ? error.message : String(error)}`;
+                    }
+                }
+                // Check if this is an MCP tool (using the new :: delimiter)
+                else {
+                    const parsedTool = MCPClientManager.parseToolName(functionName);
+                    if (parsedTool) {
+                        const { serverName, toolName } = parsedTool;
+                        let result;
+                        try {
+                            // callTool handles ensureServerConnected internally
+                            result = await mcpClientManager.callTool(serverName, toolName, functionArgs);
+                        } catch (error) {
+                            // Transport or connection error
+                            const errorMessage = error instanceof Error ? error.message : String(error);
+                            functionResponse = `Error calling MCP tool ${toolName}: ${errorMessage}`;
+                        }
+
+                        // Check if tool execution resulted in an error (per MCP spec)
+                        if (result && typeof result === 'object' && 'isError' in result && result.isError) {
+                            // Extract error information from result
+                            let errorMessage = 'Tool execution failed';
+                            if (result.content && Array.isArray(result.content)) {
+                                // Try to get text content from error result
+                                for (const content of result.content) {
+                                    if (content.type === 'text') {
+                                        errorMessage = content.text;
+                                        break;
+                                    }
+                                }
+                            }
+                            // If we couldn't get text content, fall back to stringifying
+                            if (errorMessage === 'Tool execution failed') {
+                                errorMessage = JSON.stringify(result);
+                            }
+                            functionResponse = `Error from tool ${toolName}: ${errorMessage}`;
                         } else {
-                            functionResponse = 'Invalid MCP tool format';
+                            // Successful tool execution - extract text content
+                            let textContent = '';
+                            if (result && result.content && Array.isArray(result.content)) {
+                                for (const content of result.content) {
+                                    if (content.type === 'text') {
+                                        textContent += content.text + '\n';
+                                    }
+                                    // For other content types, we could handle them differently
+                                    // For now, we'll just note their presence
+                                    else if (content.type === 'image' || content.type === 'audio') {
+                                        textContent += `[${content.type} content not displayed in text chat]\n`;
+                                    }
+                                    else if (content.type === 'resource') {
+                                        const res = content.resource as any;
+                                        textContent += `[Resource: ${res.uri || 'unknown'}]\n`;
+                                    }
+                                }
+                            }
+
+                            // Remove trailing newline
+                            textContent = textContent.trimEnd();
+
+                            // If no text content found, fall back to stringifying
+                            if (textContent === '') {
+                                textContent = JSON.stringify(result);
+                            }
+
+                            functionResponse = textContent;
                         }
                     } else {
                         // Handle regular (non-MCP) functions
@@ -471,7 +625,12 @@ client.on('message_create', async (message: Message) => {
                             functionResponse = await cleanCurrentChat(user);
                         } else if (adminUsers.includes(user)) {
                             if (functionName == 'clean_chat') {
-                                functionResponse = await cleanChat(functionArgs.user);
+                                const targetUser = functionArgs?.user;
+                                if (!targetUser) {
+                                    functionResponse = 'Error: user parameter is required for clean_chat';
+                                } else {
+                                    functionResponse = await cleanChat(targetUser);
+                                }
                             } else if (functionName == 'clean_all_chats') {
                                 functionResponse = await cleanAllChats();
                             }
@@ -490,8 +649,10 @@ client.on('message_create', async (message: Message) => {
         if (!finalResponseContent) finalResponseContent = 'Sorry, I could not complete your request after several attempts.';
         const mediaUrls: any = finalResponseContent.match(/(https?:\/\/[^\s]+)/g);
         if (mediaUrls && mediaUrls.length !== 0) {
-            finalResponseContent = finalResponseContent.replaceAll(/(https?:\/\/[^\s]+)/g, '');
-            await client.sendMessage(message.from, finalResponseContent);
+            finalResponseContent = finalResponseContent.replaceAll(/(https?:\/\/[^\s]+)/g, '').trim();
+            if (finalResponseContent !== '') {
+                await client.sendMessage(message.from, finalResponseContent);
+            }
             for (const mediaUrl of mediaUrls) {
                 await client.sendMessage(message.from, (await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true })));
             }
