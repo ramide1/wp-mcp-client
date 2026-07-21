@@ -56,4 +56,16 @@ const resetAllHistory = () => {
     return result.changes > 0;
 };
 
-export { saveHistory, loadHistory, resetHistory, resetAllHistory };
+const closeDatabase = () => {
+    for (const [name, db] of connections.entries()) {
+        try {
+            db.close();
+            console.log(`Closed database: ${name}`);
+        } catch (error: any) {
+            console.error(`Error closing database ${name}:`, error.message);
+        }
+    }
+    connections.clear();
+};
+
+export { saveHistory, loadHistory, resetHistory, resetAllHistory, closeDatabase };

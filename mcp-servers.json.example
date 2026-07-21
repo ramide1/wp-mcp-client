@@ -6,7 +6,8 @@
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "D:/files"],
       "env": {},
-      "enabled": true
+      "enabled": true,
+      "description": "Local filesystem access for reading and writing files"
     }
   ]
 }
