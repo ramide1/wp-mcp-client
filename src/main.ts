@@ -418,7 +418,7 @@ const toIsoString = (date: Date) => {
 }
 
 client.once('ready', async () => {
-    console.error('The Bot is ready!');
+    console.log('The Bot is ready!');
     try {
         await mcpClientManager.initialize();
         console.log('MCP clients initialized');
@@ -437,7 +437,14 @@ client.on('qr', (qr: string) => {
 client.on('message_create', async (message: Message) => {
     const messageText: string = message.body.trim();
     let media: MessageMedia | null = null;
-    if (message.hasMedia) media = await message.downloadMedia();
+    if (message.hasMedia) {
+        try {
+            media = await message.downloadMedia();
+        } catch (downloadError: any) {
+            console.error('Failed to download media:', downloadError);
+            return;
+        }
+    }
     const currentChat: Chat = await message.getChat();
     if ((!testMode && message.fromMe) || currentChat.isGroup || message.isStatus || (message.to === message.from) || (!media && messageText === '')) return;
     const contact: any = await client.getContactLidAndPhone([message.from]);
