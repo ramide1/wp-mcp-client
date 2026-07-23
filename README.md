@@ -61,12 +61,14 @@ Then edit the `.env` file to configure your settings:
 | `LIMIT_HISTORY` | Maximum messages per user in database | `100` |
 | `MAX_TOOL_RESULT_LENGTH` | Max characters for tool results sent to the LLM | `8000` |
 | `SANDBOX_TIMEOUT` | Timeout in seconds for `execute_code` sandbox | `30` |
+| `MAX_CONTEXT_TOKENS` | Max estimated tokens for messages array (truncates oldest messages when exceeded) | `120000` |
 | `ADMIN_USERS` | Comma-separated list of admin phone numbers | (empty) |
 | `BROWSER` | Path to browser executable for Puppeteer | (empty) |
 | `TEST_MODE` | Enable test mode (reduces logging) | `false` |
 | `INSTRUCTIONS` | Path to custom instructions file | `instructions.txt` |
 | `MCP_TOOL_THRESHOLD` | Max tools before switching to progressive discovery (search meta-tools) | `15` |
 | `MCP_STABLE_TOOLS` | Always use `call_tool` wrapper to keep tools array stable for prompt caching | `false` |
+| `CACHE_TTL` | Cache TTL in seconds for tool definitions (default: 300 = 5 minutes) | `300` |
 
 ### MCP Server Configuration
 

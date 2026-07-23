@@ -15,25 +15,35 @@ export class MCPClientManager {
   private connectingServers: Map<string, Promise<void>> = new Map(); // Track in-flight connections
   private disconnectingServers: Set<string> = new Set(); // Track in-flight disconnects
   private config: MCPConfig = { servers: [] };
-  private toolCache: Map<string, any> = new Map(); // Cache for tool definitions
-  private toolCacheTimestamps: Map<string, number> = new Map(); // Track when entries were added
+  // LRU tool cache: Map preserves insertion order; on access, entry is moved to end (most recently used).
+  // On eviction, entries are removed from the beginning (least recently used).
+  private toolCache: Map<string, { data: any; timestamp: number }> = new Map();
   private readonly MAX_CACHE_ENTRIES = 1000; // Max cache entries before LRU eviction
   private configPath: string;
   // Track last used time for each server to implement idle timeout
   private serverLastUsed: Map<string, number> = new Map();
   // ID for the idle cleanup timer
-  private idleCleanupTimer: NodeJS.Timeout | null = null;
+  private idleCleanupTimer: ReturnType<typeof setInterval> | null = null;
   // Guard to prevent overlapping async cleanup runs
   private idleCleanupRunning: boolean = false;
   // Idle timeout in milliseconds (5 minutes)
   private readonly IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+  // Cache TTL in milliseconds (configurable via CACHE_TTL env var, default 5 minutes)
+  private readonly CACHE_TTL_MS: number;
+  // Cleanup interval: proportional to TTL (1/10th), clamped between 10s and 60s
+  private readonly CLEANUP_INTERVAL_MS: number;
   // Lightweight server registry: stores tool metadata without full connections
   // Populated lazily when a server is first connected; used by searchTools
   // to avoid connecting to every server on each search query
   private serverRegistry: Map<string, { description: string; tools: Array<{ name: string; description: string }> }> = new Map();
+  // Cache for getAllToolsForDirectLoading results (invalidated on list_changed)
+  private directLoadingCache: DirectToolDefinition[] | null = null;
 
   constructor(configPath: string = './mcp-servers.json') {
     this.configPath = configPath;
+    this.CACHE_TTL_MS = parseInt(process.env.CACHE_TTL ?? '') || 5 * 60 * 1000;
+    // Cleanup interval: 1/10th of TTL, clamped between 10s and 60s
+    this.CLEANUP_INTERVAL_MS = Math.min(Math.max(this.CACHE_TTL_MS / 10, 10_000), 60_000);
     this.loadConfig();
     // Start idle cleanup timer
     this.startIdleCleanup();
@@ -48,47 +58,59 @@ export class MCPClientManager {
       clearInterval(this.idleCleanupTimer);
     }
 
-    // Check for idle servers and expired cache every minute
+    // Check for idle servers and expired cache at interval proportional to TTL
     this.idleCleanupTimer = setInterval(() => {
       this.disconnectIdleServers();
       this.evictExpiredCache();
-    }, 60 * 1000); // Check every minute
+    }, this.CLEANUP_INTERVAL_MS);
   }
 
   /**
-   * Evict cache entries that have exceeded the TTL (5 minutes)
+   * Touch a cache entry to mark it as most recently used (LRU).
+   * Deletes and re-inserts the entry to move it to the end of the Map's iteration order.
+   */
+  private touchCache(key: string): void {
+    const entry = this.toolCache.get(key);
+    if (entry) {
+      this.toolCache.delete(key);
+      this.toolCache.set(key, entry);
+    }
+  }
+
+  /**
+   * Evict cache entries that have exceeded the TTL, then enforce max size via LRU.
    */
   private evictExpiredCache(): void {
     const now = Date.now();
-    const TTL_MS = 5 * 60 * 1000;
-    const keysToDelete: string[] = [];
+    let evictedCount = 0;
 
-    for (const [key, timestamp] of this.toolCacheTimestamps.entries()) {
-      if (now - timestamp > TTL_MS) {
-        keysToDelete.push(key);
+    // Phase 1: Evict entries that exceeded the TTL (iterate oldest first)
+    const expiredKeys: string[] = [];
+    for (const [key, entry] of this.toolCache.entries()) {
+      if (now - entry.timestamp > this.CACHE_TTL_MS) {
+        expiredKeys.push(key);
       }
     }
 
-    for (const key of keysToDelete) {
+    for (const key of expiredKeys) {
       this.toolCache.delete(key);
-      this.toolCacheTimestamps.delete(key);
     }
+    evictedCount += expiredKeys.length;
 
-    // Evict oldest entries if cache exceeds max size
+    // Phase 2: Evict LRU entries (from beginning of Map) if cache exceeds max size
     if (this.toolCache.size > this.MAX_CACHE_ENTRIES) {
-      const sorted = [...this.toolCacheTimestamps.entries()]
-        .sort((a, b) => a[1] - b[1]);
       const excess = this.toolCache.size - this.MAX_CACHE_ENTRIES;
+      const iter = this.toolCache.keys();
       for (let i = 0; i < excess; i++) {
-        const [key] = sorted[i]!;
+        const { value: key, done } = iter.next();
+        if (done || !key) break;
         this.toolCache.delete(key);
-        this.toolCacheTimestamps.delete(key);
-        keysToDelete.push(key);
       }
+      evictedCount += excess;
     }
 
-    if (keysToDelete.length > 0) {
-      console.log(`Evicted ${keysToDelete.length} expired cache entries`);
+    if (evictedCount > 0) {
+      console.log(`Evicted ${evictedCount} expired cache entries`);
     }
   }
 
@@ -178,8 +200,7 @@ export class MCPClientManager {
       });
       // Also refresh the full tools cache
       const cacheKey = `${serverName}:tools`;
-      this.toolCache.set(cacheKey, toolsResponse);
-      this.toolCacheTimestamps.set(cacheKey, Date.now());
+      this.toolCache.set(cacheKey, { data: toolsResponse, timestamp: Date.now() });
       console.log(`Re-indexed registry for server ${serverName}: ${toolSummaries.length} tools`);
     } catch (error) {
       console.error(`Error re-indexing registry for ${serverName}:`, error);
@@ -199,8 +220,9 @@ export class MCPClientManager {
     }
     for (const key of keysToDelete) {
       this.toolCache.delete(key);
-      this.toolCacheTimestamps.delete(key);
     }
+    // Also invalidate directLoadingCache since server tools changed
+    this.directLoadingCache = null;
     // Registry persists to enable fast searches without reconnecting
     if (keysToDelete.length > 0) {
       console.log(`Invalidated ${keysToDelete.length} cache entries for server ${serverName}`);
@@ -234,8 +256,8 @@ export class MCPClientManager {
 
     // Clear tool cache when reconnecting
     this.toolCache.clear();
-    this.toolCacheTimestamps.clear();
     this.serverRegistry.clear();
+    this.directLoadingCache = null;
 
     // Note: We no longer automatically connect to all enabled servers on startup
     // Instead, connections are established on-demand when tools are requested
@@ -251,8 +273,11 @@ export class MCPClientManager {
       {
         // Handle tools/list_changed notifications from the server
         // Invalidates the tool cache and re-indexes the registry when the server's tool list changes
+        // autoRefresh: false because we handle the refresh manually in onChanged
+        // to avoid double listTools() calls (SDK default autoRefresh would also call listTools)
         listChanged: {
           tools: {
+            autoRefresh: false,
             onChanged: (error, tools) => {
               if (error) {
                 console.error(`Error receiving tools/list_changed from ${serverConfig.name}:`, error);
@@ -289,7 +314,13 @@ export class MCPClientManager {
       }
 
       // StreamableHTTPClientTransport is the modern transport that supports both HTTP and SSE internally
-      transport = new StreamableHTTPClientTransport(new URL(serverConfig.url));
+      transport = new StreamableHTTPClientTransport(new URL(serverConfig.url), {
+        ...(serverConfig.headers ? {
+          requestInit: {
+            headers: serverConfig.headers
+          }
+        } : {})
+      });
     } else {
       throw new Error(`Unsupported server type: ${serverConfig.type}`);
     }
@@ -310,8 +341,7 @@ export class MCPClientManager {
       });
       // Also cache the full tools list for other consumers
       const cacheKey = `${serverConfig.name}:tools`;
-      this.toolCache.set(cacheKey, toolsResponse);
-      this.toolCacheTimestamps.set(cacheKey, Date.now());
+      this.toolCache.set(cacheKey, { data: toolsResponse, timestamp: Date.now() });
     } catch (error) {
       console.error(`Error populating registry for ${serverConfig.name}:`, error);
     }
@@ -324,6 +354,14 @@ export class MCPClientManager {
       this.idleCleanupTimer = null;
     }
 
+    // Wait for any in-flight connections to complete before closing
+    const inFlight = [...this.connectingServers.values()];
+    if (inFlight.length > 0) {
+      await Promise.allSettled(inFlight);
+    }
+    this.connectingServers.clear();
+    this.disconnectingServers.clear();
+
     for (const [name, client] of this.clients.entries()) {
       try {
         await client.close();
@@ -335,8 +373,6 @@ export class MCPClientManager {
     this.clients.clear();
     this.serverLastUsed.clear();
     // Registry persists for fast searches without reconnecting
-    this.connectingServers.clear();
-    this.disconnectingServers.clear();
   }
 
   public getClient(serverName: string): Client | undefined {
@@ -394,16 +430,8 @@ export class MCPClientManager {
     this.serverLastUsed.set(serverName, Date.now());
   }
 
-  public getClients(): Map<string, Client> {
-    return new Map(this.clients);
-  }
-
   public getServerConfig(serverName: string): MCPServerConfig | undefined {
     return this.config.servers.find(server => server.name === serverName);
-  }
-
-  public getServerConfigs(): MCPServerConfig[] {
-    return [...this.config.servers];
   }
 
   /**
@@ -584,7 +612,7 @@ export class MCPClientManager {
             // Get full tool from cache if available
             const cacheKey = `${serverName}:tools`;
             const cached = this.toolCache.get(cacheKey);
-            fullTool = cached?.tools?.find((t: any) => t.name === tool.name);
+            fullTool = cached?.data?.tools?.find((t: any) => t.name === tool.name);
           }
           results.push({ ...buildResult(serverName, tool, fullTool), score });
         }
@@ -592,12 +620,18 @@ export class MCPClientManager {
       if (results.length >= limit * 2) break; // Get extra for sorting
     }
 
-    // Phase 2: Connect to unregistered servers only if results are insufficient
+    // Phase 2: Connect to unregistered servers only if results are insufficient.
+    // Limit connection attempts to avoid connecting to every server on each search.
+    const MAX_PHASE2_ATTEMPTS = 3;
+    let phase2Attempts = 0;
     if (results.length < limit) {
       for (const serverConfig of this.config.servers) {
+        if (phase2Attempts >= MAX_PHASE2_ATTEMPTS) break;
+        if (results.length >= limit * 2) break;
         if (!serverConfig.enabled) continue;
         if (this.serverRegistry.has(serverConfig.name)) continue;
 
+        phase2Attempts++;
         try {
           await this.ensureServerConnected(serverConfig.name);
           const entry = this.serverRegistry.get(serverConfig.name);
@@ -610,12 +644,11 @@ export class MCPClientManager {
               if (detailLevel === 'full') {
                 const cacheKey = `${serverConfig.name}:tools`;
                 const cached = this.toolCache.get(cacheKey);
-                fullTool = cached?.tools?.find((t: any) => t.name === tool.name);
+                fullTool = cached?.data?.tools?.find((t: any) => t.name === tool.name);
               }
               results.push({ ...buildResult(serverConfig.name, tool, fullTool), score });
             }
           }
-          if (results.length >= limit * 2) break;
         } catch (error) {
           console.error(`Error searching tools on server ${serverConfig.name}:`, error);
         }
@@ -638,24 +671,26 @@ export class MCPClientManager {
 
     // Check tool-specific cache first
     const detailCacheKey = `${serverName}:tool:${toolName}`;
-    const toolCacheGet = this.toolCache.get(detailCacheKey);
-    if (toolCacheGet !== undefined) {
-      return toolCacheGet;
+    const cachedDetail = this.toolCache.get(detailCacheKey);
+    if (cachedDetail !== undefined) {
+      this.touchCache(detailCacheKey);
+      return cachedDetail.data;
     }
 
     // Reuse the cached tools list instead of calling listTools() again
     const listCacheKey = `${serverName}:tools`;
     let toolsResponse;
-    if (this.toolCache.has(listCacheKey)) {
-      toolsResponse = this.toolCache.get(listCacheKey);
+    const cachedEntry = this.toolCache.get(listCacheKey);
+    if (cachedEntry !== undefined) {
+      toolsResponse = cachedEntry.data;
+      this.touchCache(listCacheKey);
     } else {
       const client = this.getClient(serverName);
       if (!client) {
         throw new Error(`MCP client for server ${serverName} not found`);
       }
       toolsResponse = await client.listTools();
-      this.toolCache.set(listCacheKey, toolsResponse);
-      this.toolCacheTimestamps.set(listCacheKey, Date.now());
+      this.toolCache.set(listCacheKey, { data: toolsResponse, timestamp: Date.now() });
     }
 
     const tool = toolsResponse.tools.find((t: any) => t.name === toolName);
@@ -663,9 +698,8 @@ export class MCPClientManager {
       throw new Error(`Tool ${toolName} not found on server ${serverName}`);
     }
 
-    // Cache the tool details (evicted by interval-based TTL)
-    this.toolCache.set(detailCacheKey, tool);
-    this.toolCacheTimestamps.set(detailCacheKey, Date.now());
+    // Cache the tool details (evicted by LRU)
+    this.toolCache.set(detailCacheKey, { data: tool, timestamp: Date.now() });
     return tool;
   }
 
@@ -739,6 +773,29 @@ export class MCPClientManager {
         if (propSchema.maxItems !== undefined && value.length > propSchema.maxItems) {
           errors.push(`field '${key}' must have at most ${propSchema.maxItems} items`);
         }
+        if (propSchema.uniqueItems === true) {
+          const seen = new Set<string>();
+          for (const item of value) {
+            const serialized = JSON.stringify(item);
+            if (seen.has(serialized)) {
+              errors.push(`field '${key}' must contain unique items`);
+              break;
+            }
+            seen.add(serialized);
+          }
+        }
+      }
+
+      // Pattern validation (regex)
+      if (propSchema.pattern && typeof value === 'string') {
+        try {
+          const regex = new RegExp(propSchema.pattern);
+          if (!regex.test(value)) {
+            errors.push(`field '${key}' does not match pattern: ${propSchema.pattern}`);
+          }
+        } catch {
+          // Invalid regex in schema — skip validation rather than blocking
+        }
       }
 
       // Object property count
@@ -784,13 +841,13 @@ export class MCPClientManager {
         }
       }
     } catch (error) {
-      // Re-throw validation errors and MCP errors as-is
+      // Re-throw validation errors as-is
       if (error instanceof Error && error.message.includes('Invalid arguments')) {
         throw error;
       }
-      // If getToolDetails fails (e.g. server disconnected), log but don't block the call
-      // The MCP server will validate anyway
-      console.warn(`Could not validate args for ${serverName}${toolNameDelimiter}${toolName}:`, error);
+      // If getToolDetails fails (e.g. server disconnected), skip client-side validation
+      // and let the MCP server validate — but log at error level since this bypasses our checks
+      console.error(`[SKIP VALIDATION] Could not validate args for ${serverName}${toolNameDelimiter}${toolName}:`, error);
     }
 
     try {
@@ -831,6 +888,11 @@ export class MCPClientManager {
    * @returns Array of tool definitions ready for OpenAI tools array
    */
   public async getAllToolsForDirectLoading(): Promise<DirectToolDefinition[]> {
+    // Return cached result if available (invalidated on tools/list_changed)
+    if (this.directLoadingCache !== null) {
+      return this.directLoadingCache;
+    }
+
     const allTools: DirectToolDefinition[] = [];
 
     for (const serverConfig of this.config.servers) {
@@ -841,8 +903,9 @@ export class MCPClientManager {
 
         // Reuse cached tools list (populated by connectServer)
         const cacheKey = `${serverConfig.name}:tools`;
-        const toolsResponse = this.toolCache.get(cacheKey);
-        if (!toolsResponse) continue;
+        const cachedEntry = this.toolCache.get(cacheKey);
+        if (!cachedEntry) continue;
+        const toolsResponse = cachedEntry.data;
 
         for (const tool of toolsResponse.tools) {
           const fullName = MCPClientManager.getFullToolName(serverConfig.name, tool.name);
@@ -860,6 +923,8 @@ export class MCPClientManager {
       }
     }
 
+    // Cache the result (invalidated when servers report list_changed)
+    this.directLoadingCache = allTools;
     return allTools;
   }
 
@@ -907,31 +972,6 @@ export class MCPClientManager {
     }
 
     return stubs;
-  }
-
-  /**
-   * Get a summary of all available tools for the call_tool wrapper.
-   * Returns lightweight info (name + server) without full schemas.
-   * Used to inform the LLM about available tools without changing the tools array.
-   */
-  public async getToolCatalog(): Promise<string> {
-    const lines: string[] = ['Available MCP tools:'];
-
-    for (const [serverName, entry] of this.serverRegistry.entries()) {
-      const serverConfig = this.config.servers.find(s => s.name === serverName);
-      if (!serverConfig?.enabled) continue;
-
-      lines.push(`\nServer: ${serverName}`);
-      for (const tool of entry.tools) {
-        lines.push(`  - ${tool.name}: ${tool.description || 'No description'}`);
-      }
-    }
-
-    if (lines.length === 1) {
-      return 'No MCP tools available. Use search_available_servers to see configured servers.';
-    }
-
-    return lines.join('\n');
   }
 
   /**
@@ -1015,11 +1055,6 @@ export class MCPClientManager {
     return servers;
   }
 
-  public async refreshConfig(): Promise<void> {
-    await this.disconnectAll();
-    await this.initialize();
-  }
-
   /**
    * Get the full tool name with server prefix using the delimiter
    * Format complies with MCP spec: [a-zA-Z0-9_-]+
@@ -1041,8 +1076,8 @@ export class MCPClientManager {
     const delimiterIndex = fullToolName.indexOf(toolNameDelimiter);
     if (delimiterIndex === -1) return null;
     if (delimiterIndex === 0) return null; // no server name before delimiter
-    const serverName = fullToolName.substring(0, delimiterIndex).trim();
-    const toolName = fullToolName.substring(delimiterIndex + toolNameDelimiter.length).trim();
+    const serverName = fullToolName.substring(0, delimiterIndex);
+    const toolName = fullToolName.substring(delimiterIndex + toolNameDelimiter.length);
     if (!serverName || !toolName) return null;
     return { serverName, toolName };
   }

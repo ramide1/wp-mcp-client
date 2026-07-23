@@ -2,8 +2,9 @@ import { Client, LocalAuth, MessageMedia, type Message, type Chat } from 'whatsa
 import qrcode from 'qrcode-terminal';
 import { saveHistory, loadHistory, resetHistory, resetAllHistory, closeDatabase } from './db';
 import { readFileSync, existsSync } from 'fs';
-import { MCPClientManager, toolNameDelimiter } from './mcp';
+import { MCPClientManager } from './mcp';
 import { SandboxRunner } from './sandbox';
+import type { SandboxStep, DirectToolDefinition } from './interface';
 
 const tokenOpenaiApi: string = process.env.TOKEN_OPENAI_API ?? '';
 const tokenOpenaiAudioApi: string = process.env.TOKEN_OPENAI_AUDIO_API ?? tokenOpenaiApi;
@@ -21,8 +22,11 @@ const limitTools: number = parseInt(process.env.LIMIT_TOOLS ?? '10');
 const maxToolResultLength: number = parseInt(process.env.MAX_TOOL_RESULT_LENGTH ?? '8000');
 const sandboxTimeoutMs: number = parseInt(process.env.SANDBOX_TIMEOUT ?? '30') * 1000;
 const adminUsers: string[] = (process.env.ADMIN_USERS ?? '').split(/,\s*/).map(u => u.trim()).filter(u => u.length > 0);
+// Max estimated tokens for the messages array. When exceeded, oldest non-system messages are dropped.
+// Default 120k leaves room for system prompt + tools + response in a 128k context window.
+const maxContextTokens: number = parseInt(process.env.MAX_CONTEXT_TOKENS ?? '120000');
 
-interface PuppeterConfig {
+interface PuppeteerConfig {
     args?: string[];
     headless?: boolean;
     chrome?: {
@@ -34,7 +38,7 @@ interface PuppeterConfig {
     executablePath?: string;
 }
 
-const puppeteer: PuppeterConfig = {
+const puppeteer: PuppeteerConfig = {
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
     headless: true
 };
@@ -76,7 +80,7 @@ const client = new Client({
     })
 });
 
-const tools: any[] = [
+const tools: DirectToolDefinition[] = [
     {
         type: 'function',
         function: {
@@ -215,7 +219,7 @@ const tools: any[] = [
                 properties: {
                     code: {
                         type: 'string',
-                        description: 'JavaScript code to execute. Use tools["server::tool"](args) or tool_alias(args) to call MCP tools. Return a value or use console.log for output.'
+                        description: 'JavaScript code to execute. Use tools["server__tool"](args) or tool_alias(args) to call MCP tools. Return a value or use console.log for output.'
                     }
                 },
                 required: ['code']
@@ -235,7 +239,7 @@ const tools: any[] = [
         }
     }
 ];
-const adminTools: any[] = [
+const adminTools: DirectToolDefinition[] = [
     ...tools,
     {
         type: 'function',
@@ -321,7 +325,7 @@ const truncateResult = (result: string, maxLength: number): string => {
             const lastBrace = slice.lastIndexOf('}');
             const breakPoint = Math.max(lastComma, lastBrace);
             const cleanSlice = breakPoint > maxLength * 0.5 ? slice.substring(0, breakPoint + 1) : slice;
-            return cleanSlice + `\n... ${summary}}`;
+            return cleanSlice + `\n... ${summary}`;
         }
     } catch {
         // Not JSON, fall through to plain text truncation
@@ -334,6 +338,32 @@ const truncateResult = (result: string, maxLength: number): string => {
         return slice.substring(0, lastSpace) + '...';
     }
     return slice + '...';
+};
+
+/**
+ * Extract readable text from an MCP tool call result.
+ * Handles text, image, audio, and resource content types.
+ * Falls back to JSON serialization when no text content is found.
+ */
+const extractMcpResultText = (result: any): string => {
+    let textContent = '';
+    if (result && result.content && Array.isArray(result.content)) {
+        for (const content of result.content) {
+            if (content.type === 'text') {
+                textContent += content.text + '\n';
+            } else if (content.type === 'image' || content.type === 'audio') {
+                textContent += `[${content.type} content not displayed in text chat]\n`;
+            } else if (content.type === 'resource') {
+                const res = content.resource as any;
+                textContent += `[Resource: ${res.uri || 'unknown'}]\n`;
+            }
+        }
+    }
+    textContent = textContent.trimEnd();
+    if (textContent === '') {
+        textContent = JSON.stringify(result);
+    }
+    return textContent;
 };
 
 const cleanCurrentChat = async (user: string) => {
@@ -417,6 +447,82 @@ const toIsoString = (date: Date) => {
         ':' + pad(Math.abs(tzo) % 60);
 }
 
+/**
+ * Rough token estimation: ~4 chars per token for English, ~2 for CJK.
+ * Good enough for truncation decisions; not for billing.
+ */
+const estimateTokens = (text: string): number => {
+    return Math.ceil(text.length / 4);
+};
+
+/**
+ * Estimate tokens for a single message object.
+ */
+const estimateMessageTokens = (msg: any): number => {
+    if (typeof msg.content === 'string') {
+        return estimateTokens(msg.content);
+    }
+    if (Array.isArray(msg.content)) {
+        return msg.content.reduce((sum: number, part: any) => {
+            if (part.type === 'text') return sum + estimateTokens(part.text);
+            if (part.type === 'image_url') return sum + 1000; // rough estimate for images
+            return sum;
+        }, 0);
+    }
+    // tool_calls in assistant messages
+    if (msg.tool_calls) {
+        return msg.tool_calls.reduce((sum: number, tc: any) => {
+            return sum + estimateTokens(tc.function?.name ?? '') + estimateTokens(tc.function?.arguments ?? '');
+        }, 0);
+    }
+    return 0;
+};
+
+/**
+ * Truncate messages array to fit within token budget.
+ * Keeps system message (index 0) and drops oldest non-system messages first.
+ * Never drops tool results that are referenced by pending assistant tool_calls.
+ */
+const truncateMessages = (messages: any[], maxTokens: number): any[] => {
+    let totalTokens = messages.reduce((sum, msg) => sum + estimateMessageTokens(msg), 0);
+    if (totalTokens <= maxTokens) return messages;
+
+    // Always keep the system message (index 0)
+    const systemMsg = messages[0];
+    const rest = messages.slice(1);
+
+    // Find the oldest messages we can safely drop
+    // We cannot drop a tool result if its tool_call_id is referenced by a newer assistant message
+    // Build a set of all tool_call_ids that appear in assistant messages
+    const referencedToolCallIds = new Set<string>();
+    for (const msg of rest) {
+        if (msg.tool_calls) {
+            for (const tc of msg.tool_calls) {
+                referencedToolCallIds.add(tc.id);
+            }
+        }
+    }
+
+    // Drop from the front, but skip tool results that are still referenced
+    let dropIndex = 0;
+    while (dropIndex < rest.length && totalTokens > maxTokens) {
+        const msg = rest[dropIndex];
+        // Skip if this is a tool result referenced by a later assistant message
+        if (msg.role === 'tool' && msg.tool_call_id && referencedToolCallIds.has(msg.tool_call_id)) {
+            dropIndex++;
+            continue;
+        }
+        totalTokens -= estimateMessageTokens(msg);
+        dropIndex++;
+    }
+
+    const truncated = [systemMsg, ...rest.slice(dropIndex)];
+    if (dropIndex > 0) {
+        console.log(`Truncated messages: dropped ${dropIndex} entries, ~${totalTokens} tokens remaining`);
+    }
+    return truncated;
+};
+
 client.once('ready', async () => {
     console.log('The Bot is ready!');
     try {
@@ -457,7 +563,7 @@ client.on('message_create', async (message: Message) => {
         const userHistory: any[] = loadHistory(user);
         const messages: any[] = [{ role: 'system', content: instructions + 'The current user is ' + user + " \n\n" + 'The current date in ISO String format is ' + toIsoString((new Date())) + "\n\n" + 'NEVER show the ID field to the user as it is sensitive information' + "\n\n" }];
         for (const entry of userHistory) {
-            if (entry.role == 'tool') {
+            if (entry.role === 'tool') {
                 messages.push({ role: 'tool', content: entry.text_content, tool_call_id: entry.tool_call_id, name: entry.function_name });
             } else {
                 if (entry.text_content) messages.push({ role: entry.role, content: entry.text_content });
@@ -521,7 +627,7 @@ client.on('message_create', async (message: Message) => {
         if (content.length === 0) return;
         messages.push({ role: 'user', content });
 
-        const currentTools: any[] = adminUsers.includes(user) ? adminTools : tools;
+        const currentTools: DirectToolDefinition[] = adminUsers.includes(user) ? adminTools : tools;
 
         // Progressive discovery: evaluate threshold lazily on first message
         // Use a promise to protect against race conditions when multiple messages arrive simultaneously
@@ -554,7 +660,7 @@ client.on('message_create', async (message: Message) => {
         }
 
         // Progressive discovery: if threshold not reached, load MCP tools directly
-        let finalTools: any[] = currentTools;
+        let finalTools: DirectToolDefinition[] = currentTools;
         if (useDirectLoading === true) {
             try {
                 const directMcpTools = await mcpClientManager.getAllToolsForDirectLoading();
@@ -578,6 +684,11 @@ client.on('message_create', async (message: Message) => {
         while (currentIteration < limitTools) {
             currentIteration++;
             let data: any = null;
+
+            // Truncate messages array to fit within token budget before each API call
+            const truncated = truncateMessages(messages, maxContextTokens);
+            messages.length = 0;
+            messages.push(...truncated);
 
             await functionAttempts(async () => {
                 const response: any = await fetch(urlBaseOpenaiApi, {
@@ -732,40 +843,16 @@ client.on('message_create', async (message: Message) => {
                             functionResponse = 'Error: serverName and toolName are required';
                         } else {
                             const result = await mcpClientManager.callTool(serverName, toolName, args);
-
-                            // Extract text content from result
-                            let textContent = '';
-                            if (result && result.content && Array.isArray(result.content)) {
-                                for (const content of result.content) {
-                                    if (content.type === 'text') {
-                                        textContent += content.text + '\n';
-                                    } else if (content.type === 'image' || content.type === 'audio') {
-                                        textContent += `[${content.type} content not displayed in text chat]\n`;
-                                    } else if (content.type === 'resource') {
-                                        const res = content.resource as any;
-                                        textContent += `[Resource: ${res.uri || 'unknown'}]\n`;
-                                    }
-                                }
-                            }
-
-                            textContent = textContent.trimEnd();
-                            if (textContent === '') {
-                                textContent = JSON.stringify(result);
-                            }
-
-                            functionResponse = truncateToolResult(textContent);
+                            functionResponse = truncateToolResult(extractMcpResultText(result));
                         }
                     } catch (error) {
                         const errorMessage = error instanceof Error ? error.message : String(error);
                         functionResponse = `Error calling tool: ${errorMessage}`;
                     }
                 }
-                // Handle execute_tool_sequence (programmatic tool calling)
-                // NOTE: This is a simplified implementation of MCP programmatic tool calling.
-                // Per MCP best practices, a full implementation would execute tool calls in a
-                // sandboxed environment (e.g., Deno, isolated-vm) with no direct network access.
-                // This implementation runs steps sequentially in-process, which is sufficient
-                // for WhatsApp bot use cases but does not provide sandbox isolation.
+                // Handle execute_tool_sequence (sandboxed programmatic tool calling per MCP best practices)
+                // Runs steps in an isolated Bun subprocess with tool stubs.
+                // Only the final summary returns to the model, keeping intermediate results out of context.
                 else if (functionName === 'execute_tool_sequence') {
                     try {
                         const steps = functionArgs?.steps ?? [];
@@ -779,7 +866,7 @@ client.on('message_create', async (message: Message) => {
                             functionResponse = `Error: too many steps (${steps.length}). Maximum allowed is ${MAX_STEPS}`;
                         } else {
                             // Validate all steps upfront
-                            const validatedSteps: Array<{ index: number; serverName: string; toolName: string; args: any; saveAs?: string; useResultFrom?: string; valid: boolean; error?: string }> = [];
+                            const validatedSteps: SandboxStep[] = [];
                             for (let i = 0; i < steps.length; i++) {
                                 const step = steps[i];
                                 if (!step || typeof step !== 'object') {
@@ -802,102 +889,26 @@ client.on('message_create', async (message: Message) => {
                                 validatedSteps.push({ index: i, serverName, toolName, args: args ?? {}, saveAs, useResultFrom, valid: true });
                             }
 
-                            // Build dependency graph and group into parallel waves
-                            // A step can run in parallel if it doesn't useResultFrom any step in the current or future wave
-                            const results: Record<string, any> = {};
-                            const stepOutputs: string[] = new Array(steps.length);
-                            let successCount = 0;
-                            let errorCount = 0;
-                            const STEP_TIMEOUT_MS = 30_000;
+                            // Get available tool stubs for the sandbox
+                            const toolStubs = await mcpClientManager.getToolsForSandbox();
+                            if (toolStubs.length === 0) {
+                                functionResponse = 'No MCP tools available. Connect to an MCP server first.';
+                            } else {
+                                // Execute in sandboxed subprocess — intermediate results stay isolated
+                                const result = await sandboxRunner.executeToolSequence(validatedSteps, toolStubs, sandboxTimeoutMs, summaryPrompt);
 
-                            const executeStep = async (vs: typeof validatedSteps[0]) => {
-                                if (!vs.valid) {
-                                    stepOutputs[vs.index] = `Step ${vs.index + 1}: Error - ${vs.error}`;
-                                    errorCount++;
-                                    return;
+                                let responseText = '';
+                                if (result.error) {
+                                    responseText = `Sandbox error: ${result.error}`;
+                                    if (result.output) responseText += `\nOutput before error:\n${result.output}`;
+                                } else {
+                                    responseText = result.output || '(no output)';
                                 }
-
-                                let resolvedArgs = vs.args;
-                                if (vs.useResultFrom && typeof vs.useResultFrom === 'string' && results[vs.useResultFrom]) {
-                                    resolvedArgs = results[vs.useResultFrom];
+                                if (result.toolCalls > 0) {
+                                    responseText += `\n(${result.toolCalls} tool call(s) executed)`;
                                 }
-
-                                try {
-                                    const result = await Promise.race([
-                                        mcpClientManager.callTool(vs.serverName, vs.toolName, resolvedArgs),
-                                        new Promise<never>((_, reject) =>
-                                            setTimeout(() => reject(new Error(`Step timeout after ${STEP_TIMEOUT_MS / 1000}s`)), STEP_TIMEOUT_MS)
-                                        )
-                                    ]);
-
-                                    let textContent = '';
-                                    if (result && result.content && Array.isArray(result.content)) {
-                                        for (const content of result.content) {
-                                            if (content.type === 'text') {
-                                                textContent += content.text;
-                                            }
-                                        }
-                                    }
-                                    if (!textContent) textContent = JSON.stringify(result);
-
-                                    if (vs.saveAs && typeof vs.saveAs === 'string') {
-                                        results[vs.saveAs] = textContent;
-                                    }
-                                    stepOutputs[vs.index] = `Step ${vs.index + 1} (${vs.serverName}${toolNameDelimiter}${vs.toolName}): ${truncateResult(textContent, 300)}`;
-                                    successCount++;
-                                } catch (error) {
-                                    const errorMessage = error instanceof Error ? error.message : String(error);
-                                    stepOutputs[vs.index] = `Step ${vs.index + 1} (${vs.serverName}${toolNameDelimiter}${vs.toolName}): Error - ${errorMessage}`;
-                                    errorCount++;
-                                }
-                            };
-
-                            // Group steps into waves by dependencies
-                            const remaining = [...validatedSteps];
-                            while (remaining.length > 0) {
-                                // Find steps whose dependencies are already satisfied
-                                const ready = remaining.filter(vs => {
-                                    if (!vs.valid) return true; // invalid steps run immediately
-                                    if (!vs.useResultFrom) return true; // no dependency
-                                    return vs.useResultFrom in results; // dependency already resolved
-                                });
-
-                                if (ready.length === 0) {
-                                    // Circular dependency or unresolvable reference — run remaining sequentially
-                                    for (const vs of remaining) {
-                                        await executeStep(vs);
-                                    }
-                                    break;
-                                }
-
-                                // Execute ready steps in parallel
-                                await Promise.all(ready.map(vs => executeStep(vs)));
-
-                                // Remove executed steps from remaining
-                                for (const vs of ready) {
-                                    remaining.splice(remaining.indexOf(vs), 1);
-                                }
+                                functionResponse = responseText;
                             }
-
-                            const summaryLines: string[] = [];
-                            summaryLines.push(`Tool sequence completed: ${successCount} succeeded, ${errorCount} failed out of ${steps.length} steps.`);
-                            summaryLines.push('');
-                            summaryLines.push('Step details:');
-                            summaryLines.push(stepOutputs.filter(Boolean).join('\n'));
-
-                            if (Object.keys(results).length > 0) {
-                                summaryLines.push('');
-                                summaryLines.push('Saved results:');
-                                for (const [key, value] of Object.entries(results)) {
-                                    const preview = typeof value === 'string' ? truncateResult(value, 200) : truncateResult(JSON.stringify(value), 200);
-                                    summaryLines.push(`  ${key}: ${preview}`);
-                                }
-                            }
-
-                            summaryLines.push('');
-                            summaryLines.push(`Request: ${summaryPrompt}`);
-
-                            functionResponse = summaryLines.join('\n');
                         }
                     } catch (error) {
                         functionResponse = `Error executing tool sequence: ${error instanceof Error ? error.message : String(error)}`;
@@ -944,28 +955,7 @@ client.on('message_create', async (message: Message) => {
                         try {
                             // callTool handles ensureServerConnected and isError->throw internally
                             const result = await mcpClientManager.callTool(serverName, toolName, functionArgs);
-
-                            // Extract text content from successful result
-                            let textContent = '';
-                            if (result && result.content && Array.isArray(result.content)) {
-                                for (const content of result.content) {
-                                    if (content.type === 'text') {
-                                        textContent += content.text + '\n';
-                                    } else if (content.type === 'image' || content.type === 'audio') {
-                                        textContent += `[${content.type} content not displayed in text chat]\n`;
-                                    } else if (content.type === 'resource') {
-                                        const res = content.resource as any;
-                                        textContent += `[Resource: ${res.uri || 'unknown'}]\n`;
-                                    }
-                                }
-                            }
-
-                            textContent = textContent.trimEnd();
-                            if (textContent === '') {
-                                textContent = JSON.stringify(result);
-                            }
-
-                            functionResponse = truncateToolResult(textContent);
+                            functionResponse = truncateToolResult(extractMcpResultText(result));
                         } catch (error) {
                             // Transport errors AND MCP tool errors (isError: true) both end up here
                             const errorMessage = error instanceof Error ? error.message : String(error);
@@ -973,17 +963,17 @@ client.on('message_create', async (message: Message) => {
                         }
                     } else {
                         // Handle regular (non-MCP) functions
-                        if (functionName == 'clean_current_chat') {
+                        if (functionName === 'clean_current_chat') {
                             functionResponse = await cleanCurrentChat(user);
                         } else if (adminUsers.includes(user)) {
-                            if (functionName == 'clean_chat') {
+                            if (functionName === 'clean_chat') {
                                 const targetUser = functionArgs?.user;
                                 if (!targetUser) {
                                     functionResponse = 'Error: user parameter is required for clean_chat';
                                 } else {
                                     functionResponse = await cleanChat(targetUser);
                                 }
-                            } else if (functionName == 'clean_all_chats') {
+                            } else if (functionName === 'clean_all_chats') {
                                 functionResponse = await cleanAllChats();
                             }
                         }
@@ -1012,17 +1002,22 @@ client.on('message_create', async (message: Message) => {
             await client.sendMessage(message.from, finalResponseContent);
         }
     } catch (error: any) {
-        if (testMode) console.error(error);
-        saveHistory(user, 'assistant', error.message, '', '');
-        await client.sendMessage(message.from, error.message);
+        console.error(`Error for user ${user}:`, error);
+        saveHistory(user, 'assistant', 'An error occurred processing your request. Please try again.', '', '');
+        await client.sendMessage(message.from, 'An error occurred processing your request. Please try again.');
+    } finally {
+        // Always release the session lock, even if the catch block throws
+        if (!currentSession) sessions.delete(user);
     }
-    if (!currentSession) sessions.delete(user);
 });
 
 client.initialize();
 
 // Graceful shutdown: disconnect MCP servers and close database on process exit
+let isShuttingDown = false;
 const shutdown = async () => {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
     console.log('\nShutting down, disconnecting MCP servers and closing database...');
     await mcpClientManager.disconnectAll();
     closeDatabase();
@@ -1031,20 +1026,26 @@ const shutdown = async () => {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 process.on('beforeExit', () => {
-    mcpClientManager.disconnectAll().catch(() => { });
-    closeDatabase();
+    if (!isShuttingDown) {
+        mcpClientManager.disconnectAll().catch(() => { });
+        closeDatabase();
+    }
 });
 
 // Handle unhandled errors: ensure MCP servers are disconnected and DB is closed
 // Per MCP best practices: "Handle server disconnections" and proper resource cleanup
 process.on('unhandledRejection', (reason, promise) => {
     console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-    mcpClientManager.disconnectAll().catch(() => { });
-    closeDatabase();
+    if (!isShuttingDown) {
+        mcpClientManager.disconnectAll().catch(() => { });
+        closeDatabase();
+    }
 });
 process.on('uncaughtException', (error) => {
     console.error('Uncaught Exception:', error);
-    mcpClientManager.disconnectAll().catch(() => { });
-    closeDatabase();
+    if (!isShuttingDown) {
+        mcpClientManager.disconnectAll().catch(() => { });
+        closeDatabase();
+    }
     process.exit(1);
 });

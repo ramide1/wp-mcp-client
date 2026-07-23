@@ -2,7 +2,7 @@ import { randomUUID } from 'crypto';
 import { writeFileSync, unlinkSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import type { MCPClientManager } from './mcp';
-import type { SandboxResult, SandboxToolStub } from './interface';
+import type { SandboxResult, SandboxToolStub, SandboxStep } from './interface';
 
 /**
  * SandboxRunner executes model-generated code in an isolated Bun subprocess.
@@ -14,7 +14,7 @@ import type { SandboxResult, SandboxToolStub } from './interface';
  * - Output filtering: only console output returns to the model
  *
  * Communication protocol (JSON lines over stdin/stdout):
- * - Child → Parent: {"type":"call","id":"...","tool":"server::tool","args":{...}}
+ * - Child → Parent: {"type":"call","id":"...","tool":"server__tool","args":{...}}
  * - Parent → Child: {"type":"result","id":"...","result":...} or {"type":"result","id":"...","error":"..."}
  * - Child → Parent: {"type":"done","output":"..."}
  */
@@ -45,7 +45,7 @@ export class SandboxRunner {
 
     try {
       writeFileSync(scriptPath, this.buildScript(code, tools), 'utf8');
-      const proc = Bun.spawn(['bun', 'run', scriptPath], {
+      const proc = Bun.spawn(['bun', 'run', '--max-old-space-size=256', scriptPath], {
         stdout: 'pipe',
         stderr: 'pipe',
         stdin: 'pipe',
@@ -119,7 +119,14 @@ export class SandboxRunner {
         if (done) break;
         stderrText += decoder.decode(value, { stream: true });
       }
-      if (stderrText && !output) error = stderrText;
+      if (stderrText) {
+        if (!output) {
+          error = stderrText;
+        } else {
+          // stderr produced alongside stdout — append as warning
+          output += `\n[STDERR] ${stderrText}`;
+        }
+      }
     })();
 
     const timeout = new Promise<never>((_, reject) => {
@@ -138,14 +145,20 @@ export class SandboxRunner {
       }
     }
 
-    return { output: error ? '' : output, error, toolCalls: toolCallCount };
+    return { output, error, toolCalls: toolCallCount };
   }
 
-  private buildScript(code: string, tools: SandboxToolStub[]): string {
-    const safeName = (fullName: string) => `__mcp_${fullName.replace(/[^a-zA-Z0-9_]/g, '_')}`;
+  private safeName(fullName: string): string {
+    return `__mcp_${fullName.replace(/[^a-zA-Z0-9_]/g, '_')}`;
+  }
 
+  /**
+   * Generate tool stubs and the tools object map for sandbox scripts.
+   * Shared by buildScript and buildToolSequenceScript.
+   */
+  private generateToolStubs(tools: SandboxToolStub[]): { stubsCode: string; toolMapCode: string; aliasesCode: string } {
     const stubs = tools.map(tool => {
-      const fn = safeName(tool.fullName);
+      const fn = this.safeName(tool.fullName);
       return `
 async function ${fn}(args = {}) {
   const __id = String(Date.now()) + Math.random().toString(36).slice(2);
@@ -179,25 +192,31 @@ async function ${fn}(args = {}) {
     }).join('\n');
 
     const toolMap = tools.map(tool => {
-      const fn = safeName(tool.fullName);
+      const fn = this.safeName(tool.fullName);
       return `  ${JSON.stringify(tool.fullName)}: ${fn},`;
     }).join('\n');
 
     const aliases = tools.map(tool => {
-      const fn = safeName(tool.fullName);
+      const fn = this.safeName(tool.fullName);
       const alias = tool.fullName.replace(/[^a-zA-Z0-9_]/g, '_');
       return alias !== fn ? `const ${alias} = ${fn};` : '';
     }).filter(Boolean).join('\n');
 
+    return { stubsCode: stubs, toolMapCode: toolMap, aliasesCode: aliases };
+  }
+
+  private buildScript(code: string, tools: SandboxToolStub[]): string {
+    const { stubsCode, toolMapCode, aliasesCode } = this.generateToolStubs(tools);
+
     return `
 // MCP Sandbox - Auto-generated tool stubs
-${stubs}
+${stubsCode}
 
 const tools = {
-${toolMap}
+${toolMapCode}
 };
 
-${aliases}
+${aliasesCode}
 
 const __output = [];
 const __origLog = console.log;
@@ -215,6 +234,159 @@ try {
   process.exit(1);
 }
 process.exit(0);
+`;
+  }
+
+  /**
+   * Execute a sequence of MCP tool calls in a sandboxed subprocess.
+   * Tool stubs are injected via stdin/stdout JSON lines protocol.
+   * Intermediate results stay in the subprocess — only the summary returns to the model.
+   * @param steps Validated steps to execute (with dependency graph via saveAs/useResultFrom)
+   * @param tools Available tool stubs for the sandbox
+   * @param timeoutMs Maximum execution time in milliseconds
+   * @param summaryPrompt A prompt describing what summary to produce
+   * @returns Sandbox result with summary output and optional error
+   */
+  async executeToolSequence(
+    steps: SandboxStep[],
+    tools: SandboxToolStub[],
+    timeoutMs: number,
+    summaryPrompt: string
+  ): Promise<SandboxResult> {
+    if (tools.length === 0) {
+      return { output: '', error: 'No MCP tools available for sandbox execution', toolCalls: 0 };
+    }
+
+    const id = randomUUID();
+    const scriptPath = join(this.sandboxDir, `${id}.ts`);
+
+    try {
+      writeFileSync(scriptPath, this.buildToolSequenceScript(steps, tools, summaryPrompt), 'utf8');
+      const proc = Bun.spawn(['bun', 'run', '--max-old-space-size=256', scriptPath], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+        stdin: 'pipe',
+      });
+      return await this.runSubprocess(proc, tools, timeoutMs);
+    } finally {
+      try { unlinkSync(scriptPath); } catch { }
+    }
+  }
+
+  private buildToolSequenceScript(
+    steps: SandboxStep[],
+    tools: SandboxToolStub[],
+    summaryPrompt: string
+  ): string {
+    const { stubsCode, toolMapCode } = this.generateToolStubs(tools);
+
+    const stepsJson = JSON.stringify(steps.map(s => ({
+      index: s.index,
+      serverName: s.serverName,
+      toolName: s.toolName,
+      args: s.args || {},
+      saveAs: s.saveAs || null,
+      useResultFrom: s.useResultFrom || null,
+      valid: s.valid,
+      error: s.error || null,
+    })));
+
+    return `
+// MCP Sandbox - Tool Sequence Execution (sandboxed)
+${stubsCode}
+
+const tools = {
+${toolMapCode}
+};
+
+const steps = ${stepsJson};
+const summaryPrompt = ${JSON.stringify(summaryPrompt)};
+const STEP_TIMEOUT_MS = 30000;
+
+const results = {};
+const outputs = [];
+let successCount = 0;
+let errorCount = 0;
+
+async function executeStep(step) {
+  if (!step.valid) {
+    outputs.push(\`Step \${step.index + 1}: Error - \${step.error}\`);
+    errorCount++;
+    return;
+  }
+
+  let args = step.args;
+  if (step.useResultFrom && results[step.useResultFrom]) {
+    try { args = JSON.parse(results[step.useResultFrom]); } catch { args = results[step.useResultFrom]; }
+  }
+
+  const fullName = step.serverName + "__" + step.toolName;
+  const toolFn = tools[fullName];
+  if (!toolFn) {
+    outputs.push(\`Step \${step.index + 1} (\${fullName}): Error - Tool not found\`);
+    errorCount++;
+    return;
+  }
+
+  try {
+    const result = await Promise.race([
+      toolFn(args),
+      new Promise((_, rej) => setTimeout(() => rej(new Error(\`Step timeout after \${STEP_TIMEOUT_MS / 1000}s\`)), STEP_TIMEOUT_MS))
+    ]);
+
+    let text = '';
+    if (result?.content && Array.isArray(result.content)) {
+      for (const c of result.content) {
+        if (c.type === 'text') text += c.text;
+      }
+    }
+    if (!text) text = JSON.stringify(result);
+
+    if (step.saveAs) results[step.saveAs] = text;
+
+    const truncated = text.length > 300 ? text.substring(0, 300) + '...' : text;
+    outputs.push(\`Step \${step.index + 1} (\${fullName}): \${truncated}\`);
+    successCount++;
+  } catch (e) {
+    outputs.push(\`Step \${step.index + 1} (\${fullName}): Error - \${e.message || String(e)}\`);
+    errorCount++;
+  }
+}
+
+// Group steps into waves by dependencies
+const remaining = [...steps];
+while (remaining.length > 0) {
+  const ready = remaining.filter(s => {
+    if (!s.valid) return true;
+    if (!s.useResultFrom) return true;
+    return s.useResultFrom in results;
+  });
+
+  if (ready.length === 0) {
+    for (const s of remaining) await executeStep(s);
+    break;
+  }
+
+  await Promise.all(ready.map(s => executeStep(s)));
+  for (const s of ready) remaining.splice(remaining.indexOf(s), 1);
+}
+
+console.log(\`Tool sequence completed: \${successCount} succeeded, \${errorCount} failed out of \${steps.length} steps.\`);
+console.log('');
+console.log('Step details:');
+console.log(outputs.join('\\n'));
+
+if (Object.keys(results).length > 0) {
+  console.log('');
+  console.log('Saved results:');
+  for (const [key, value] of Object.entries(results)) {
+    const preview = typeof value === 'string' ? value.substring(0, 200) : JSON.stringify(value).substring(0, 200);
+    console.log(\`  \${key}: \${preview}\`);
+  }
+}
+
+console.log('');
+console.log(\`Request: \${summaryPrompt}\`);
 `;
   }
 }

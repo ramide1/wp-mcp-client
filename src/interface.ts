@@ -3,7 +3,8 @@ export interface MCPServerConfig {
   type: 'stdio' | 'streamable-http'; // stdio for local processes, streamable-http for remote servers
   command?: string; // For stdio: the command to run (e.g., "npx", "python")
   args?: string[]; // Arguments for the command
-  url?: string; // For sse: the server URL
+  url?: string; // For streamable-http: the server URL
+  headers?: Record<string, string>; // For streamable-http: custom headers (e.g., Authorization)
   env?: Record<string, string>; // Environment variables for stdio servers
   enabled: boolean; // Whether this server should be connected
   description?: string; // Human-readable description of what this server provides
@@ -40,7 +41,7 @@ export interface DirectToolDefinition {
   function: {
     name: string;
     description: string;
-    parameters: Record<string, unknown>;
+    parameters?: Record<string, unknown>;
   };
 };
 
@@ -57,3 +58,14 @@ export interface SandboxResult {
   error?: string;
   toolCalls: number;
 };
+
+export interface SandboxStep {
+  index: number;
+  serverName: string;
+  toolName: string;
+  args: any;
+  saveAs?: string;
+  useResultFrom?: string;
+  valid: boolean;
+  error?: string;
+}

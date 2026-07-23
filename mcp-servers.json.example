@@ -8,6 +8,16 @@
       "env": {},
       "enabled": true,
       "description": "Local filesystem access for reading and writing files"
+    },
+    {
+      "name": "remote-server",
+      "type": "streamable-http",
+      "url": "https://example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN_HERE"
+      },
+      "enabled": false,
+      "description": "Example remote MCP server with auth headers"
     }
   ]
 }
