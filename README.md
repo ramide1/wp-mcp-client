@@ -107,7 +107,7 @@ bun run src/main.ts
 
 2. Scan the QR code displayed in the terminal with your WhatsApp app to link the device.
 
-3. The bot will automatically connect to configured MCP servers and make their tools available for use.
+3. The bot connects to configured MCP servers on-demand when a tool from that server is invoked, and disconnects them after 5 minutes of inactivity.
 
 4. Send messages to the bot to interact with AI models and available MCP tools.
 
@@ -120,7 +120,7 @@ When you send a message to the bot:
    - **Direct mode**: MCP tools are in the tools array, model calls them directly
    - **Discovery mode**: Model uses `search_tools` to find relevant tools, `get_tool_details` to inspect schemas, then `call_tool` to execute
 4. For multi-step operations, the model can use:
-   - `execute_tool_sequence`: Chain multiple tool calls with result sharing (in-process)
+   - `execute_tool_sequence`: Chain multiple tool calls with result sharing (runs in a sandboxed Bun subprocess)
    - `execute_code`: Write JavaScript that calls tools in a sandboxed subprocess
 5. If tools are needed, the bot executes them and incorporates the results
 6. The final response is sent back to you via WhatsApp
@@ -140,13 +140,13 @@ When you send a message to the bot:
 
 This implementation follows the Model Context Protocol (MCP) specification and best practices as outlined in the [MCP documentation](https://modelcontextprotocol.io/docs/develop/build-client) and [MCP client best practices](https://modelcontextprotocol.io/docs/develop/clients/client-best-practices):
 - Progressive tool discovery with `search_tools` and `get_tool_details` for finding and inspecting tools
-- Programmatic tool calling via `execute_tool_sequence` for chaining multiple tool calls without passing intermediate results through the model (simplified implementation, not sandboxed)
+- Programmatic tool calling via `execute_tool_sequence` for chaining multiple tool calls without passing intermediate results through the model (runs in a sandboxed Bun subprocess)
 - Sandboxed code execution via `execute_code` runs model-generated JavaScript in an isolated Bun subprocess with MCP tool stubs; only `console.log` output returns to the model
 - Dynamic server management: servers connected on-demand, disconnected after 5 min idle
 - Lightweight server registry: stores tool metadata (name + description) without full connections, enabling fast search without connecting to every server
 - Tool cache with interval-based TTL (5 min) and invalidation on `tools/list_changed` notifications
 - Argument validation: `callTool()` validates arguments against tool input schemas before sending to MCP servers
-- Smart result truncation: structural-aware truncation preserves JSON formatting in tool sequence summaries
+- Smart result truncation: `call_tool` uses structural-aware truncation (`truncateResult` in `src/main.ts`) that preserves JSON formatting and provides summaries (e.g. `Array[N items]`, `Object{key1, ...}`). `execute_tool_sequence`'s sandbox uses a simpler fixed-length per-step preview.
 - Properly handles MCP tool responses including `isError` flags per specification
 - Supports both stdio and StreamableHTTP transports
 

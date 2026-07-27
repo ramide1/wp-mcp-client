@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { writeFileSync, unlinkSync, mkdirSync } from 'fs';
 import { join } from 'path';
+import { toolNameDelimiter } from './mcp';
 import type { MCPClientManager } from './mcp';
 import type { SandboxResult, SandboxToolStub, SandboxStep } from './interface';
 
@@ -140,9 +141,11 @@ export class SandboxRunner {
       // Wait for BOTH stdout and stderr to finish, or timeout
       await Promise.race([Promise.all([stdoutDone, stderrDone]), timeout]);
     } catch (err) {
+      // Only the timeout promise rejects (the stream readers catch their own errors)
       if (err instanceof Error && err.message.includes('timed out')) {
         return { output: '', error: err.message, toolCalls: toolCallCount };
       }
+      throw err;
     }
 
     return { output, error, toolCalls: toolCallCount };
@@ -156,7 +159,10 @@ export class SandboxRunner {
    * Generate tool stubs and the tools object map for sandbox scripts.
    * Shared by buildScript and buildToolSequenceScript.
    */
-  private generateToolStubs(tools: SandboxToolStub[]): { stubsCode: string; toolMapCode: string; aliasesCode: string } {
+  private generateToolStubs(
+    tools: SandboxToolStub[],
+    includeAliases: boolean = true
+  ): { stubsCode: string; toolMapCode: string; aliasesCode: string } {
     const stubs = tools.map(tool => {
       const fn = this.safeName(tool.fullName);
       return `
@@ -196,13 +202,15 @@ async function ${fn}(args = {}) {
       return `  ${JSON.stringify(tool.fullName)}: ${fn},`;
     }).join('\n');
 
-    const aliases = tools.map(tool => {
-      const fn = this.safeName(tool.fullName);
-      const alias = tool.fullName.replace(/[^a-zA-Z0-9_]/g, '_');
-      return alias !== fn ? `const ${alias} = ${fn};` : '';
-    }).filter(Boolean).join('\n');
+    const aliasesCode = includeAliases
+      ? tools.map(tool => {
+        const fn = this.safeName(tool.fullName);
+        const alias = tool.fullName.replace(/[^a-zA-Z0-9_]/g, '_');
+        return `const ${alias} = ${fn};`;
+      }).join('\n')
+      : '';
 
-    return { stubsCode: stubs, toolMapCode: toolMap, aliasesCode: aliases };
+    return { stubsCode: stubs, toolMapCode: toolMap, aliasesCode };
   }
 
   private buildScript(code: string, tools: SandboxToolStub[]): string {
@@ -219,16 +227,14 @@ ${toolMapCode}
 ${aliasesCode}
 
 const __output = [];
-const __origLog = console.log;
-const __origError = console.error;
 console.log = (...a) => __output.push(a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' '));
 console.error = (...a) => __output.push('[ERROR] ' + a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' '));
 
 try {
-  const __result = await (async () => {
+  await (async () => {
     ${code}
   })();
-  process.stdout.write(JSON.stringify({type:'done',output:__output.join('\\n'),result:__result!==undefined?__result:null})+'\\n');
+  process.stdout.write(JSON.stringify({type:'done',output:__output.join('\\n')})+'\\n');
 } catch(e) {
   process.stderr.write(e.message || String(e));
   process.exit(1);
@@ -278,7 +284,7 @@ process.exit(0);
     tools: SandboxToolStub[],
     summaryPrompt: string
   ): string {
-    const { stubsCode, toolMapCode } = this.generateToolStubs(tools);
+    const { stubsCode, toolMapCode } = this.generateToolStubs(tools, false);
 
     const stepsJson = JSON.stringify(steps.map(s => ({
       index: s.index,
@@ -320,7 +326,7 @@ async function executeStep(step) {
     try { args = JSON.parse(results[step.useResultFrom]); } catch { args = results[step.useResultFrom]; }
   }
 
-  const fullName = step.serverName + "__" + step.toolName;
+  const fullName = step.serverName + toolNameDelimiter + step.toolName;
   const toolFn = tools[fullName];
   if (!toolFn) {
     outputs.push(\`Step \${step.index + 1} (\${fullName}): Error - Tool not found\`);
@@ -390,3 +396,21 @@ console.log(\`Request: \${summaryPrompt}\`);
 `;
   }
 }
+
+/**
+ * Format a SandboxResult into a human-readable string for the LLM.
+ * Shared by the execute_tool_sequence and execute_code handlers in main.ts.
+ */
+export const formatSandboxResult = (result: SandboxResult): string => {
+  let responseText = '';
+  if (result.error) {
+    responseText = `Sandbox error: ${result.error}`;
+    if (result.output) responseText += `\nOutput before error:\n${result.output}`;
+  } else {
+    responseText = result.output || '(no output)';
+  }
+  if (result.toolCalls > 0) {
+    responseText += `\n(${result.toolCalls} tool call(s) executed)`;
+  }
+  return responseText;
+};

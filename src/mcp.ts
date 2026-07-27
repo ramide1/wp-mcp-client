@@ -49,6 +49,43 @@ export class MCPClientManager {
     this.startIdleCleanup();
   }
 
+  /** Build the cache key for a server's full tools list. */
+  private cacheKeyTools(serverName: string): string {
+    return `${serverName}:tools`;
+  }
+
+  /** Build the cache key for a specific tool's details. */
+  private cacheKeyToolDetail(serverName: string, toolName: string): string {
+    return `${serverName}:tool:${toolName}`;
+  }
+
+  /**
+   * Populate (or refresh) the lightweight server registry and the full tools-list cache
+   * for a single connected server. Shared by connectServer and refreshServerRegistry.
+   * @param serverName Name of the (already-connected) server
+   * @param client Connected MCP Client for the server
+   * @param fallbackDescription Description to use if no prior registry entry exists
+   */
+  private async populateServerRegistry(
+    serverName: string,
+    client: Client,
+    fallbackDescription: string
+  ): Promise<void> {
+    const toolsResponse = await client.listTools();
+    const toolSummaries = toolsResponse.tools.map((t: any) => ({
+      name: t.name,
+      description: t.description || ''
+    }));
+    // Preserve a prior description if one already exists in the registry
+    const existingDescription = this.serverRegistry.get(serverName)?.description;
+    this.serverRegistry.set(serverName, {
+      description: existingDescription || fallbackDescription,
+      tools: toolSummaries
+    });
+    // Cache the full tools list for other consumers (getToolDetails, getAllToolsForDirectLoading, etc.)
+    this.toolCache.set(this.cacheKeyTools(serverName), { data: toolsResponse, timestamp: Date.now() });
+  }
+
   /**
    * Start the idle cleanup timer to disconnect unused servers and evict expired cache entries
    */
@@ -189,18 +226,12 @@ export class MCPClientManager {
     if (!client) return;
 
     try {
-      const toolsResponse = await client.listTools();
-      const toolSummaries = toolsResponse.tools.map((t: any) => ({
-        name: t.name,
-        description: t.description || ''
-      }));
-      this.serverRegistry.set(serverName, {
-        description: this.serverRegistry.get(serverName)?.description || `MCP server: ${serverName}`,
-        tools: toolSummaries
-      });
-      // Also refresh the full tools cache
-      const cacheKey = `${serverName}:tools`;
-      this.toolCache.set(cacheKey, { data: toolsResponse, timestamp: Date.now() });
+      await this.populateServerRegistry(
+        serverName,
+        client,
+        `MCP server: ${serverName}`
+      );
+      const toolSummaries = this.serverRegistry.get(serverName)?.tools ?? [];
       console.log(`Re-indexed registry for server ${serverName}: ${toolSummaries.length} tools`);
     } catch (error) {
       console.error(`Error re-indexing registry for ${serverName}:`, error);
@@ -278,7 +309,7 @@ export class MCPClientManager {
         listChanged: {
           tools: {
             autoRefresh: false,
-            onChanged: (error, tools) => {
+            onChanged: (error) => {
               if (error) {
                 console.error(`Error receiving tools/list_changed from ${serverConfig.name}:`, error);
                 return;
@@ -330,18 +361,11 @@ export class MCPClientManager {
 
     // Populate lightweight registry with tool metadata (no full schema)
     try {
-      const toolsResponse = await client.listTools();
-      const toolSummaries = toolsResponse.tools.map((t: any) => ({
-        name: t.name,
-        description: t.description || ''
-      }));
-      this.serverRegistry.set(serverConfig.name, {
-        description: serverConfig.description || `MCP server: ${serverConfig.name} (${serverConfig.type})`,
-        tools: toolSummaries
-      });
-      // Also cache the full tools list for other consumers
-      const cacheKey = `${serverConfig.name}:tools`;
-      this.toolCache.set(cacheKey, { data: toolsResponse, timestamp: Date.now() });
+      await this.populateServerRegistry(
+        serverConfig.name,
+        client,
+        serverConfig.description || `MCP server: ${serverConfig.name} (${serverConfig.type})`
+      );
     } catch (error) {
       console.error(`Error populating registry for ${serverConfig.name}:`, error);
     }
@@ -375,7 +399,7 @@ export class MCPClientManager {
     // Registry persists for fast searches without reconnecting
   }
 
-  public getClient(serverName: string): Client | undefined {
+  private getClient(serverName: string): Client | undefined {
     const client = this.clients.get(serverName);
     if (client) {
       // Update last used time
@@ -390,7 +414,7 @@ export class MCPClientManager {
    * Concurrent calls for the same server will wait for the in-flight connection.
    * @param serverName Name of the server to ensure is connected
    */
-  public async ensureServerConnected(serverName: string): Promise<void> {
+  private async ensureServerConnected(serverName: string): Promise<void> {
     // If already connected, just update the last used time
     if (this.clients.has(serverName)) {
       this.serverLastUsed.set(serverName, Date.now());
@@ -428,10 +452,6 @@ export class MCPClientManager {
 
     // Mark as recently used
     this.serverLastUsed.set(serverName, Date.now());
-  }
-
-  public getServerConfig(serverName: string): MCPServerConfig | undefined {
-    return this.config.servers.find(server => server.name === serverName);
   }
 
   /**
@@ -610,8 +630,7 @@ export class MCPClientManager {
           let fullTool: any = undefined;
           if (detailLevel === 'full') {
             // Get full tool from cache if available
-            const cacheKey = `${serverName}:tools`;
-            const cached = this.toolCache.get(cacheKey);
+            const cached = this.toolCache.get(this.cacheKeyTools(serverName));
             fullTool = cached?.data?.tools?.find((t: any) => t.name === tool.name);
           }
           results.push({ ...buildResult(serverName, tool, fullTool), score });
@@ -642,8 +661,7 @@ export class MCPClientManager {
             if (score > 0) {
               let fullTool: any = undefined;
               if (detailLevel === 'full') {
-                const cacheKey = `${serverConfig.name}:tools`;
-                const cached = this.toolCache.get(cacheKey);
+                const cached = this.toolCache.get(this.cacheKeyTools(serverConfig.name));
                 fullTool = cached?.data?.tools?.find((t: any) => t.name === tool.name);
               }
               results.push({ ...buildResult(serverConfig.name, tool, fullTool), score });
@@ -670,7 +688,7 @@ export class MCPClientManager {
     await this.ensureServerConnected(serverName);
 
     // Check tool-specific cache first
-    const detailCacheKey = `${serverName}:tool:${toolName}`;
+    const detailCacheKey = this.cacheKeyToolDetail(serverName, toolName);
     const cachedDetail = this.toolCache.get(detailCacheKey);
     if (cachedDetail !== undefined) {
       this.touchCache(detailCacheKey);
@@ -678,7 +696,7 @@ export class MCPClientManager {
     }
 
     // Reuse the cached tools list instead of calling listTools() again
-    const listCacheKey = `${serverName}:tools`;
+    const listCacheKey = this.cacheKeyTools(serverName);
     let toolsResponse;
     const cachedEntry = this.toolCache.get(listCacheKey);
     if (cachedEntry !== undefined) {
@@ -902,8 +920,7 @@ export class MCPClientManager {
         await this.ensureServerConnected(serverConfig.name);
 
         // Reuse cached tools list (populated by connectServer)
-        const cacheKey = `${serverConfig.name}:tools`;
-        const cachedEntry = this.toolCache.get(cacheKey);
+        const cachedEntry = this.toolCache.get(this.cacheKeyTools(serverConfig.name));
         if (!cachedEntry) continue;
         const toolsResponse = cachedEntry.data;
 
@@ -979,7 +996,7 @@ export class MCPClientManager {
    * Only uses the registry (no new connections). Returns 0 if registry is not yet populated.
    * @returns Total number of tools available from registry
    */
-  public getToolCountFromRegistry(): number {
+  private getToolCountFromRegistry(): number {
     let count = 0;
     for (const serverConfig of this.config.servers) {
       if (!serverConfig.enabled) continue;
@@ -1001,16 +1018,10 @@ export class MCPClientManager {
     const registryCount = this.getToolCountFromRegistry();
     if (registryCount > 0) return registryCount;
 
-    // Fallback: connect unregistered servers
+    // Fallback: connect unregistered servers (registry is empty)
     let count = 0;
     for (const serverConfig of this.config.servers) {
       if (!serverConfig.enabled) continue;
-
-      const registryEntry = this.serverRegistry.get(serverConfig.name);
-      if (registryEntry) {
-        count += registryEntry.tools.length;
-        continue;
-      }
 
       try {
         await this.ensureServerConnected(serverConfig.name);

@@ -37,7 +37,7 @@ const saveHistory = (user: string, role: string, textContent: string, toolCallId
 const loadHistory = (user: string) => {
     const db: Database = getDb();
     const query: any = db.query('SELECT * FROM chat_history WHERE user = ? ORDER BY id ASC LIMIT ?');
-    return query.all(user, maxHistory) ?? [];
+    return query.all(user, maxHistory);
 };
 
 const resetHistory = (user: string) => {
@@ -52,7 +52,7 @@ const resetAllHistory = () => {
     const query: any = db.query('DELETE FROM chat_history');
     const result: any = query.run();
     const queryIds: any = db.query('DELETE FROM sqlite_sequence WHERE name = "chat_history"');
-    queryIds.run()
+    queryIds.run();
     return result.changes > 0;
 };
 

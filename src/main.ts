@@ -1,9 +1,9 @@
-import { Client, LocalAuth, MessageMedia, type Message, type Chat } from 'whatsapp-web.js';
+﻿import { Client, LocalAuth, MessageMedia, type Message, type Chat } from 'whatsapp-web.js';
 import qrcode from 'qrcode-terminal';
 import { saveHistory, loadHistory, resetHistory, resetAllHistory, closeDatabase } from './db';
 import { readFileSync, existsSync } from 'fs';
 import { MCPClientManager } from './mcp';
-import { SandboxRunner } from './sandbox';
+import { SandboxRunner, formatSandboxResult } from './sandbox';
 import type { SandboxStep, DirectToolDefinition } from './interface';
 
 const tokenOpenaiApi: string = process.env.TOKEN_OPENAI_API ?? '';
@@ -278,10 +278,8 @@ const instructions: string = ((instructionsFileContent !== '') ? instructionsFil
  * Truncate tool result to prevent context window overflow.
  * Uses structural-aware truncation when possible.
  */
-const truncateToolResult = (result: string, maxLength: number = maxToolResultLength): string => {
-    if (!result || result.length <= maxLength) return result;
-    return truncateResult(result, maxLength);
-};
+const truncateToolResult = (result: string, maxLength: number = maxToolResultLength): string =>
+    truncateResult(result, maxLength);
 
 /**
  * Smart truncation that preserves JSON structure when possible.
@@ -341,6 +339,13 @@ const truncateResult = (result: string, maxLength: number): string => {
 };
 
 /**
+ * Safely stringify an unknown error into a string message.
+ * Handles Error instances, plain values, and objects with a `message` property.
+ */
+const errMsg = (e: unknown): string =>
+    e instanceof Error ? e.message : String(e);
+
+/**
  * Extract readable text from an MCP tool call result.
  * Handles text, image, audio, and resource content types.
  * Falls back to JSON serialization when no text content is found.
@@ -366,23 +371,20 @@ const extractMcpResultText = (result: any): string => {
     return textContent;
 };
 
-const cleanCurrentChat = async (user: string) => {
+const resetHistoryWithMessage = (user: string, successMsg: string, errorPrefix: string): string => {
     try {
-        if (!resetHistory(user)) throw new Error('Error clearing message history');
-        return 'Message history cleared successfully';
+        if (!resetHistory(user)) throw new Error(errorPrefix);
+        return successMsg;
     } catch (error: any) {
         return error.message;
     }
 };
 
-const cleanChat = async (user: string) => {
-    try {
-        if (!resetHistory(user)) throw new Error('Error clearing message history for ' + user);
-        return 'Message history for ' + user + ' cleared successfully';
-    } catch (error: any) {
-        return error.message;
-    }
-};
+const cleanCurrentChat = async (user: string) =>
+    resetHistoryWithMessage(user, 'Message history cleared successfully', 'Error clearing message history');
+
+const cleanChat = async (user: string) =>
+    resetHistoryWithMessage(user, 'Message history for ' + user + ' cleared successfully', 'Error clearing message history for ' + user);
 
 const cleanAllChats = async () => {
     try {
@@ -555,7 +557,7 @@ client.on('message_create', async (message: Message) => {
     if ((!testMode && message.fromMe) || currentChat.isGroup || message.isStatus || (message.to === message.from) || (!media && messageText === '')) return;
     const contact: any = await client.getContactLidAndPhone([message.from]);
     const user: string = contact?.[0]?.pn ?? message.from.split('@')[0];
-    const currentSession: number | boolean = sessions.get(user) ?? false;
+    const currentSession: boolean = sessions.get(user) ?? false;
     try {
         if (currentSession) throw new Error('Responding to previous message. Please wait before sending a new message');
         sessions.set(user, true);
@@ -565,6 +567,17 @@ client.on('message_create', async (message: Message) => {
         for (const entry of userHistory) {
             if (entry.role === 'tool') {
                 messages.push({ role: 'tool', content: entry.text_content, tool_call_id: entry.tool_call_id, name: entry.function_name });
+            } else if (entry.role === 'assistant' && entry.function_name) {
+                // function_name holds JSON.stringify(tool_calls) for assistant messages that invoked tools
+                try {
+                    const toolCalls = JSON.parse(entry.function_name);
+                    const msg: any = { role: 'assistant' };
+                    if (entry.text_content) msg.content = entry.text_content;
+                    if (Array.isArray(toolCalls) && toolCalls.length > 0) msg.tool_calls = toolCalls;
+                    messages.push(msg);
+                } catch {
+                    if (entry.text_content) messages.push({ role: 'assistant', content: entry.text_content });
+                }
             } else {
                 if (entry.text_content) messages.push({ role: entry.role, content: entry.text_content });
             }
@@ -596,8 +609,6 @@ client.on('message_create', async (message: Message) => {
             formData.append('language', audioLanguage);
             formData.append('prompt', 'Transcribe the audio');
             formData.append('response_format', 'json');
-            audioResponse = null;
-            audioData = null;
             await functionAttempts(async () => {
                 audioResponse = await fetch(urlBaseOpenaiAudioApi, {
                     method: 'POST',
@@ -717,9 +728,15 @@ client.on('message_create', async (message: Message) => {
             if (!aiMessage) throw new Error('Failed response. Please try again in a few seconds');
             const toolCalls: any[] = aiMessage.tool_calls ?? [];
 
-            // Only save to history if assistant has content (skip when only tool calls)
-            if (aiMessage.content) {
-                saveHistory(user, 'assistant', aiMessage.content, '', '');
+            // Persist assistant message: save content and/or tool_calls (serialized in function_name column)
+            if (aiMessage.content || (toolCalls.length > 0)) {
+                saveHistory(
+                    user,
+                    'assistant',
+                    aiMessage.content ?? '',
+                    '',
+                    (toolCalls.length > 0) ? JSON.stringify(toolCalls) : ''
+                );
             }
             messages.push(aiMessage);
 
@@ -780,7 +797,7 @@ client.on('message_create', async (message: Message) => {
                         }
                         functionResponse = resultText;
                     } catch (error) {
-                        functionResponse = `Error searching tools: ${error instanceof Error ? error.message : String(error)}`;
+                        functionResponse = `Error searching tools: ${errMsg(error)}`;
                     }
                 }
                 // Handle search_available_servers function
@@ -798,7 +815,7 @@ client.on('message_create', async (message: Message) => {
                         }
                         functionResponse = resultText;
                     } catch (error) {
-                        functionResponse = `Error listing servers: ${error instanceof Error ? error.message : String(error)}`;
+                        functionResponse = `Error listing servers: ${errMsg(error)}`;
                     }
                 }
                 // Handle get_tool_details function
@@ -829,7 +846,7 @@ client.on('message_create', async (message: Message) => {
                             functionResponse = resultText;
                         }
                     } catch (error) {
-                        functionResponse = `Error getting tool details: ${error instanceof Error ? error.message : String(error)}`;
+                        functionResponse = `Error getting tool details: ${errMsg(error)}`;
                     }
                 }
                 // Handle call_tool function (single tool call via stable wrapper)
@@ -846,7 +863,7 @@ client.on('message_create', async (message: Message) => {
                             functionResponse = truncateToolResult(extractMcpResultText(result));
                         }
                     } catch (error) {
-                        const errorMessage = error instanceof Error ? error.message : String(error);
+                        const errorMessage = errMsg(error);
                         functionResponse = `Error calling tool: ${errorMessage}`;
                     }
                 }
@@ -894,24 +911,13 @@ client.on('message_create', async (message: Message) => {
                             if (toolStubs.length === 0) {
                                 functionResponse = 'No MCP tools available. Connect to an MCP server first.';
                             } else {
-                                // Execute in sandboxed subprocess — intermediate results stay isolated
+                                // Execute in sandboxed subprocess â€” intermediate results stay isolated
                                 const result = await sandboxRunner.executeToolSequence(validatedSteps, toolStubs, sandboxTimeoutMs, summaryPrompt);
-
-                                let responseText = '';
-                                if (result.error) {
-                                    responseText = `Sandbox error: ${result.error}`;
-                                    if (result.output) responseText += `\nOutput before error:\n${result.output}`;
-                                } else {
-                                    responseText = result.output || '(no output)';
-                                }
-                                if (result.toolCalls > 0) {
-                                    responseText += `\n(${result.toolCalls} tool call(s) executed)`;
-                                }
-                                functionResponse = responseText;
+                                functionResponse = formatSandboxResult(result);
                             }
                         }
                     } catch (error) {
-                        functionResponse = `Error executing tool sequence: ${error instanceof Error ? error.message : String(error)}`;
+                        functionResponse = `Error executing tool sequence: ${errMsg(error)}`;
                     }
                 }
                 // Handle execute_code (sandboxed programmatic tool calling per MCP best practices)
@@ -929,22 +935,11 @@ client.on('message_create', async (message: Message) => {
                                 functionResponse = 'No MCP tools available for sandbox execution. Connect to an MCP server first.';
                             } else {
                                 const result = await sandboxRunner.execute(code, toolStubs, sandboxTimeoutMs);
-
-                                let responseText = '';
-                                if (result.error) {
-                                    responseText = `Sandbox error: ${result.error}`;
-                                    if (result.output) responseText += `\nOutput before error:\n${result.output}`;
-                                } else {
-                                    responseText = result.output || '(no output)';
-                                }
-                                if (result.toolCalls > 0) {
-                                    responseText += `\n(${result.toolCalls} tool call(s) executed)`;
-                                }
-                                functionResponse = responseText;
+                                functionResponse = formatSandboxResult(result);
                             }
                         }
                     } catch (error) {
-                        functionResponse = `Error in sandbox execution: ${error instanceof Error ? error.message : String(error)}`;
+                        functionResponse = `Error in sandbox execution: ${errMsg(error)}`;
                     }
                 }
                 // Check if this is an MCP tool (using the __ delimiter)
@@ -958,7 +953,7 @@ client.on('message_create', async (message: Message) => {
                             functionResponse = truncateToolResult(extractMcpResultText(result));
                         } catch (error) {
                             // Transport errors AND MCP tool errors (isError: true) both end up here
-                            const errorMessage = error instanceof Error ? error.message : String(error);
+                            const errorMessage = errMsg(error);
                             functionResponse = `Error calling MCP tool ${toolName}: ${errorMessage}`;
                         }
                     } else {
@@ -980,12 +975,15 @@ client.on('message_create', async (message: Message) => {
                     }
                 }
 
-                messages.push({
+                const toolMessage = {
                     tool_call_id: toolCall.id,
                     role: 'tool',
                     name: functionName,
                     content: functionResponse
-                });
+                };
+                messages.push(toolMessage);
+                // Persist tool result so it can be reconstructed on subsequent requests
+                saveHistory(user, 'tool', functionResponse, toolCall.id, functionName);
             }
         }
         if (!finalResponseContent) finalResponseContent = 'Sorry, I could not complete your request after several attempts.';
