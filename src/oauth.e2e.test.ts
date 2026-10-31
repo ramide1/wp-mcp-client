@@ -8,6 +8,7 @@ import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { MCPClientManager } from './mcp';
+import { handleAdminCommand } from './commands';
 import { startTestOAuthServer, type TestOAuthServer } from './test-support/oauth-test-server';
 
 const tempDirs: string[] = [];
@@ -200,6 +201,60 @@ describe('oauth: authorization code flow', () => {
 
         await expect(manager.callTool('remote', 'whoami', {})).rejects.toThrow();
         expect(manager.getAuthorizationUrl('remote')).toBeUndefined();
+
+        await manager.disconnectAll();
+    });
+});
+
+describe('oauth: the /oauth admin command', () => {
+    test('shows the pending URL and finishes the flow with the code', async () => {
+        const server = await startTestOAuthServer();
+        servers.push(server);
+        const dir = mkdtempSync(join(tmpdir(), 'oauth-e2e-'));
+        tempDirs.push(dir);
+        const manager = createManager(server.mcpUrl, join(dir, 'oauth.json'));
+
+        const dependencies = {
+            getAuthorizationUrl: (serverName: string) => manager.getAuthorizationUrl(serverName),
+            completeAuthorization: (serverName: string, code: string) => manager.completeAuthorization(serverName, code)
+        };
+
+        // 1. The first call starts the flow and asks for the authorization
+        await expect(manager.callTool('remote', 'whoami', {})).rejects.toThrow(/requires OAuth authorization/);
+
+        // 2. The admin asks for the URL of the pending flow
+        const urlAnswer = await handleAdminCommand('/oauth remote', dependencies);
+        expect(urlAnswer).toBeDefined();
+        expect(urlAnswer).toContain('/authorize');
+        expect(urlAnswer).toContain('code_challenge=');
+
+        // 3. The user authorizes and the admin sends the code
+        const redirect = await fetch(manager.getAuthorizationUrl('remote')!, { redirect: 'manual' });
+        const code = new URL(redirect.headers.get('Location') ?? '').searchParams.get('code');
+        expect(code).toBeTruthy();
+
+        const codeAnswer = await handleAdminCommand(`/oauth remote ${code}`, dependencies);
+        expect(codeAnswer).toContain('Authorization completed for "remote"');
+
+        // 4. The next call is authenticated
+        const result = await manager.callTool('remote', 'whoami', {});
+        expect(result.content?.[0]?.text).toBe('authorized caller');
+
+        await manager.disconnectAll();
+    });
+
+    test('explains that there is nothing pending', async () => {
+        const server = await startTestOAuthServer();
+        servers.push(server);
+        const dir = mkdtempSync(join(tmpdir(), 'oauth-e2e-'));
+        tempDirs.push(dir);
+        const manager = createManager(server.mcpUrl, join(dir, 'oauth.json'));
+
+        const answer = await handleAdminCommand('/oauth remote', {
+            getAuthorizationUrl: (serverName: string) => manager.getAuthorizationUrl(serverName),
+            completeAuthorization: (serverName: string, code: string) => manager.completeAuthorization(serverName, code)
+        });
+        expect(answer).toContain('No pending authorization for "remote"');
 
         await manager.disconnectAll();
     });

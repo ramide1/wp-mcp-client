@@ -142,7 +142,8 @@ Remote servers can authenticate with OAuth 2.1 instead of a static header:
   optionally, `dynamicRegistration: true` to register the client on the fly
   (RFC 7591). The bot logs the authorization URL and reports it when a tool
   call fails; an admin can then finish the flow from WhatsApp with
-  `/oauth <serverName> <authorizationCode>`.
+  `/oauth <serverName> <authorizationCode>`. The command `/oauth <serverName>`
+  (without a code) shows the authorization URL of the pending flow.
 - Tokens, client information and the PKCE verifier are persisted in
   `auth/oauth-<server>.json` (gitignored), so a restart does not force a new
   authorization round trip.
@@ -248,7 +249,7 @@ bun run typecheck  # TypeScript type check (no emit)
 
 The test suite is split in three layers:
 
-- **Unit tests** (`src/*.test.ts`): pure helpers, JSON Schema validator, sandbox, confirmation manager, SEP-2243 headers, logger, OAuth provider, SQLite history and the tool dispatcher.
+- **Unit tests** (`src/*.test.ts`): pure helpers, JSON Schema validator, sandbox, confirmation manager, SEP-2243 headers, logger, OAuth provider, SQLite history, OpenAI client, attachments, admin commands and the tool dispatcher.
 - **Integration tests** (`src/mcp.integration.test.ts`): the client is connected to a real MCP server served over Streamable HTTP (`src/test-support/mcp-test-server.ts`), so pagination, resources, prompts, tool errors, `list_changed` notifications and the SEP-2243 header mirroring are exercised against the actual protocol.
 - **End-to-end tests** (`src/oauth.e2e.test.ts`): the whole OAuth 2.1 flow (`authorization_code` with PKCE and `client_credentials`) against a mock authorization server (`src/test-support/oauth-test-server.ts`).
 

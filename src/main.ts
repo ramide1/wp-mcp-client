@@ -5,8 +5,11 @@ import { readFileSync, existsSync } from 'fs';
 import { MCPClientManager } from './mcp';
 import { SandboxRunner } from './sandbox';
 import { ToolDispatcher } from './dispatch';
-import { reconstructHistory } from './conversation';
+import { reconstructHistory, buildSystemMessage } from './conversation';
 import { truncateMessages, extractMediaUrls, stripMediaUrls } from './text';
+import { withRetries, callChatCompletion, extractAssistantMessage, transcribeAudio } from './api';
+import { classifyAttachment, buildAudioFileName, buildMediaDataUrl, UNSUPPORTED_ATTACHMENT_MESSAGE, IMAGE_NOT_SUPPORTED_MESSAGE } from './attachments';
+import { handleAdminCommand } from './commands';
 import { intFromEnv, timeoutFromEnv } from './env';
 import type { DirectToolDefinition } from './interface';
 import { ConfirmationManager } from './confirm';
@@ -380,67 +383,6 @@ const confirmationInstructions: string = `
 const instructions: string = ((instructionsFileContent !== '') ? instructionsFileContent : 'You are an assistant') + confirmationInstructions;
 
 /**
- * Safely stringify an unknown error into a string message.
- * Handles Error instances, plain values, and objects with a `message` property.
- */
-const errMsg = (e: unknown): string =>
-    e instanceof Error ? e.message : String(e);
-
-const RETRYABLE_ERROR_PATTERNS = [
-    'Rate limit reached',
-    'rate_limit',
-    'ECONNRESET',
-    'ETIMEDOUT',
-    'ECONNREFUSED',
-    'network',
-    'timeout',
-    '502',
-    '503',
-    '504',
-];
-
-const isRetryableError = (error: any): boolean => {
-    const msg = String(error?.message ?? error ?? '').toLowerCase();
-    return RETRYABLE_ERROR_PATTERNS.some(p => msg.includes(p.toLowerCase()));
-};
-
-const functionAttempts = async (functionAttempt: any) => {
-    let attempts: number = 0;
-    let lastError: any = null;
-    while (attempts < limitFetch) {
-        try {
-            return await functionAttempt();
-        } catch (error: any) {
-            lastError = error;
-            attempts++;
-            // Don't retry permanent errors (invalid args, auth failures, etc.)
-            if (!isRetryableError(error)) {
-                throw error;
-            }
-            if (attempts < limitFetch) await new Promise(resolve => setTimeout(resolve, limitTime));
-        }
-    }
-    throw lastError ?? new Error('Function failed after retries');
-};
-
-const toIsoString = (date: Date) => {
-    const tzo: number = -date.getTimezoneOffset(),
-        dif: string = tzo >= 0 ? '+' : '-',
-        pad: any = function (num: number) {
-            return (num < 10 ? '0' : '') + num;
-        };
-
-    return date.getFullYear() +
-        '-' + pad(date.getMonth() + 1) +
-        '-' + pad(date.getDate()) +
-        'T' + pad(date.getHours()) +
-        ':' + pad(date.getMinutes()) +
-        ':' + pad(date.getSeconds()) +
-        dif + pad(Math.floor(Math.abs(tzo) / 60)) +
-        ':' + pad(Math.abs(tzo) % 60);
-}
-
-/**
  * Placeholders shipped in `.env.example`. A key that still contains one of
  * them is not a real credential: the bot would start and fail on every
  * message, so it is rejected at startup instead.
@@ -540,32 +482,27 @@ client.on('message_create', async (message: Message) => {
         return;
     }
 
-    // Admin command to finish an interactive OAuth authorization:
-    //   /oauth <serverName> <authorizationCode>
-    if (adminUsers.includes(user) && messageText.startsWith('/oauth ')) {
-        const parts = messageText.slice('/oauth '.length).trim().split(/\s+/);
-        const serverName = parts[0] ?? '';
-        const code = parts.slice(1).join(' ');
-        if (!serverName || !code) {
-            await client.sendMessage(message.from, 'Usage: /oauth <serverName> <authorizationCode>');
+    // Admin command to manage the interactive OAuth authorization:
+    //   /oauth <serverName>              -> shows the authorization URL
+    //   /oauth <serverName> <authCode>   -> finishes the authorization
+    if (adminUsers.includes(user)) {
+        const answer = await handleAdminCommand(messageText, {
+            getAuthorizationUrl: (serverName: string) => mcpClientManager.getAuthorizationUrl(serverName),
+            completeAuthorization: (serverName: string, code: string) => mcpClientManager.completeAuthorization(serverName, code)
+        });
+        if (answer !== undefined) {
+            await client.sendMessage(message.from, answer);
             return;
         }
-        try {
-            await mcpClientManager.completeAuthorization(serverName, code);
-            await client.sendMessage(message.from, `Authorization completed for "${serverName}". The next tool call will reconnect the server.`);
-        } catch (error) {
-            await client.sendMessage(message.from, `Could not complete the authorization of "${serverName}": ${errMsg(error)}`);
-        }
-        return;
     }
 
     const currentSession: boolean = sessions.get(user) ?? false;
     try {
         if (currentSession) throw new Error('Responding to previous message. Please wait before sending a new message');
         sessions.set(user, true);
-        if (media && !(media.mimetype.startsWith('audio/') || media.mimetype.startsWith('image/'))) throw new Error('Unsupported attachment, only images and audio in flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, or webm format are accepted');
+        if (media && !(media.mimetype.startsWith('audio/') || media.mimetype.startsWith('image/'))) throw new Error(UNSUPPORTED_ATTACHMENT_MESSAGE);
         const userHistory: any[] = loadHistory(user);
-        const messages: any[] = [{ role: 'system', content: instructions + 'The current user is ' + user + " \n\n" + 'The current date in ISO String format is ' + toIsoString((new Date())) + "\n\n" + 'NEVER show the ID field to the user as it is sensitive information' + "\n\n" }];
+        const messages: any[] = [{ role: 'system', content: buildSystemMessage(instructions, user, new Date()) }];
         messages.push(...reconstructHistory(userHistory));
         const content: any[] = [];
         let imageNotSupported = false;
@@ -577,48 +514,27 @@ client.on('message_create', async (message: Message) => {
             saveHistory(user, 'user', messageText, '', '');
         }
         if (media && media.mimetype.startsWith('audio/')) {
-            let fileName: string = media.filename ?? '';
-            if (fileName === '') {
-                const extension: string = media.mimetype.split('/')[1]?.split(' ')[0]?.replace(';', '') ?? '';
-                if (extension !== '') fileName = 'audio.' + extension;
-            }
-            let audioResponse: any = await fetch('data:' + media.mimetype + ';base64,' + media.data);
-            if (!audioResponse.ok) throw new Error('Failed response when converting audio');
-            let audioData: any = await audioResponse.blob();
-            const formData: FormData = new FormData();
-            if (fileName !== '') {
-                formData.append('file', audioData, fileName)
-            } else {
-                formData.append('file', audioData)
-            }
-            formData.append('model', modelApiAudioOpenai);
-            formData.append('language', audioLanguage);
-            formData.append('prompt', 'Transcribe the audio');
-            formData.append('response_format', 'json');
-            await functionAttempts(async () => {
-                audioResponse = await fetch(urlBaseOpenaiAudioApi, {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': 'Bearer ' + tokenOpenaiAudioApi
-                    },
-                    body: formData
-                });
-                if (!audioResponse.ok) throw new Error(`Audio API HTTP ${audioResponse.status}`);
-                audioData = await audioResponse.json();
-                if (!audioData || !audioData.text || (audioData.text === '')) throw new Error();
-            });
-            if (!audioData || !audioData.text || (audioData.text === '')) throw new Error('Failed response when transcribing audio');
+            const fileName = buildAudioFileName(media.mimetype, media.filename ?? undefined);
+            const audioText = await withRetries(async () => await transcribeAudio({
+                url: urlBaseOpenaiAudioApi,
+                apiKey: tokenOpenaiAudioApi,
+                model: modelApiAudioOpenai,
+                language: audioLanguage,
+                mimeType: media.mimetype,
+                data: media.data,
+                fileName
+            }), { attempts: limitFetch, delayMs: limitTime });
             content.push({
                 type: 'text',
-                text: audioData.text
+                text: audioText
             });
-            saveHistory(user, 'user', audioData.text, '', '');
+            saveHistory(user, 'user', audioText, '', '');
         } else if (media && media.mimetype.startsWith('image/')) {
-            if (modelSupportsImage) {
+            if (classifyAttachment(media.mimetype, modelSupportsImage) === 'image') {
                 content.push({
                     type: 'image_url',
                     image_url: {
-                        url: 'data:' + media.mimetype + ';base64,' + media.data
+                        url: buildMediaDataUrl(media.mimetype, media.data)
                     }
                 });
             } else {
@@ -629,8 +545,7 @@ client.on('message_create', async (message: Message) => {
             }
         }
         if (imageNotSupported) {
-            await client.sendMessage(message.from,
-                'The configured model cannot process images. Please describe the image in text or send it again as text.');
+            await client.sendMessage(message.from, IMAGE_NOT_SUPPORTED_MESSAGE);
         }
         if (content.length === 0) return;
         messages.push({ role: 'user', content });
@@ -708,37 +623,18 @@ client.on('message_create', async (message: Message) => {
             messages.length = 0;
             messages.push(...truncated);
 
-            await functionAttempts(async () => {
-                const response: any = await fetch(urlBaseOpenaiApi, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': 'Bearer ' + tokenOpenaiApi
-                    },
-                    body: JSON.stringify({
-                        model: modelApiOpenai,
-                        messages,
-                        tools: finalTools,
-                        tool_choice: 'auto',
-                        max_completion_tokens: limitTokensOpenai
-                    })
+            await withRetries(async () => {
+                data = await callChatCompletion({
+                    url: urlBaseOpenaiApi,
+                    apiKey: tokenOpenaiApi,
+                    model: modelApiOpenai,
+                    messages,
+                    tools: finalTools,
+                    maxTokens: limitTokensOpenai
                 });
-                if (!response.ok) {
-                    let errorBody = '';
-                    try { errorBody = await response.text(); } catch { }
-                    const detail = errorBody ? `: ${errorBody.substring(0, 200)}` : '';
-                    throw new Error(`HTTP ${response.status}${detail}`);
-                }
-                data = await response.json();
-                if (!data || (data.error && data.error.message && data.error.message.startsWith('Rate limit reached for model'))) {
-                    throw new Error(data?.error?.message ?? 'Rate limit reached');
-                }
-            });
+            }, { attempts: limitFetch, delayMs: limitTime });
 
-            if (!data || data.error || !data.choices) throw new Error('Failed response. Please try again in a few seconds');
-            const aiMessage: any = data.choices[0].message ?? null;
-            if (!aiMessage) throw new Error('Failed response. Please try again in a few seconds');
-            const toolCalls: any[] = aiMessage.tool_calls ?? [];
+            const { message: aiMessage, toolCalls } = extractAssistantMessage(data);
 
             // Persist assistant message: save content and/or tool_calls (serialized in function_name column)
             if (aiMessage.content || (toolCalls.length > 0)) {

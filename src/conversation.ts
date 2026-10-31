@@ -17,6 +17,38 @@ export interface HistoryEntry {
 }
 
 /**
+ * Format a date as a local ISO-like string with the UTC offset.
+ *
+ * The format is `YYYY-MM-DDTHH:mm:ss+HH:mm`.
+ */
+export const toIsoString = (date: Date): string => {
+    const tzo: number = -date.getTimezoneOffset();
+    const dif: string = tzo >= 0 ? '+' : '-';
+    const pad = (num: number): string => (num < 10 ? '0' : '') + num;
+
+    return date.getFullYear() +
+        '-' + pad(date.getMonth() + 1) +
+        '-' + pad(date.getDate()) +
+        'T' + pad(date.getHours()) +
+        ':' + pad(date.getMinutes()) +
+        ':' + pad(date.getSeconds()) +
+        dif + pad(Math.floor(Math.abs(tzo) / 60)) +
+        ':' + pad(Math.abs(tzo) % 60);
+};
+
+/**
+ * Build the system message of the conversation.
+ *
+ * It carries the instructions of the operator, the identity of the user and
+ * the current date.
+ */
+export const buildSystemMessage = (instructions: string, user: string, now: Date): string =>
+    instructions +
+    'The current user is ' + user + ' \n\n' +
+    'The current date in ISO String format is ' + toIsoString(now) + '\n\n' +
+    'NEVER show the ID field to the user as it is sensitive information' + '\n\n';
+
+/**
  * Rebuild the messages array of the API from the rows of the history table.
  *
  * The encoding is quirky on purpose (see AGENTS.md):

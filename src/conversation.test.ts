@@ -1,5 +1,35 @@
 import { describe, expect, test } from 'bun:test';
-import { reconstructHistory, extractMcpResultText, extractResourceText, summarizeToolArgs } from './conversation';
+import { reconstructHistory, extractMcpResultText, extractResourceText, summarizeToolArgs, toIsoString, buildSystemMessage } from './conversation';
+
+describe('toIsoString', () => {
+    test('formats the date with the local offset', () => {
+        const date = new Date(2026, 0, 2, 3, 4, 5);
+        const formatted = toIsoString(date);
+        expect(formatted).toMatch(/^2026-01-02T03:04:05[+-]\d{2}:\d{2}$/);
+    });
+
+    test('pads the hours, minutes and seconds', () => {
+        const date = new Date(2026, 10, 30, 9, 8, 7);
+        const formatted = toIsoString(date);
+        expect(formatted).toContain('T09:08:07');
+    });
+});
+
+describe('buildSystemMessage', () => {
+    const now = new Date(2026, 0, 2, 3, 4, 5);
+
+    test('includes the instructions, the user and the date', () => {
+        const message = buildSystemMessage('You are an assistant\n', '555@c.us', now);
+        expect(message).toContain('You are an assistant');
+        expect(message).toContain('The current user is 555@c.us');
+        expect(message).toContain('The current date in ISO String format is ' + toIsoString(now));
+    });
+
+    test('warns the model about the identifiers', () => {
+        const message = buildSystemMessage('Instructions', '555@c.us', now);
+        expect(message).toContain('NEVER show the ID field to the user as it is sensitive information');
+    });
+});
 
 describe('reconstructHistory', () => {
     test('rebuilds a plain user message', () => {
