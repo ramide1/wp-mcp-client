@@ -17,7 +17,33 @@
         "Authorization": "Bearer YOUR_TOKEN_HERE"
       },
       "enabled": false,
-      "description": "Example remote MCP server with auth headers"
+      "description": "Example remote MCP server with static auth headers"
+    },
+    {
+      "name": "remote-oauth",
+      "type": "streamable-http",
+      "url": "https://example.com/mcp",
+      "oauth": {
+        "grant": "client_credentials",
+        "clientId": "YOUR_CLIENT_ID",
+        "clientSecret": "YOUR_CLIENT_SECRET",
+        "scope": "read write"
+      },
+      "enabled": false,
+      "description": "Example remote MCP server with OAuth 2.1 (client credentials)"
+    },
+    {
+      "name": "remote-oauth-interactive",
+      "type": "streamable-http",
+      "url": "https://example.com/mcp",
+      "oauth": {
+        "grant": "authorization_code",
+        "redirectUri": "http://localhost:8080/callback",
+        "dynamicRegistration": true,
+        "scope": "read"
+      },
+      "enabled": false,
+      "description": "Example remote MCP server with OAuth 2.1 (authorization code + PKCE). The tokens are stored in auth/oauth-<name>.json"
     }
   ]
 }

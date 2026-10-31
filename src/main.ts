@@ -1,10 +1,18 @@
 ﻿import { Client, LocalAuth, MessageMedia, type Message, type Chat } from 'whatsapp-web.js';
 import qrcode from 'qrcode-terminal';
-import { saveHistory, loadHistory, resetHistory, resetAllHistory, closeDatabase } from './db';
+import { saveHistory, loadHistory, closeDatabase } from './db';
 import { readFileSync, existsSync } from 'fs';
 import { MCPClientManager } from './mcp';
-import { SandboxRunner, formatSandboxResult } from './sandbox';
-import type { SandboxStep, DirectToolDefinition } from './interface';
+import { SandboxRunner } from './sandbox';
+import { ToolDispatcher } from './dispatch';
+import { reconstructHistory } from './conversation';
+import { truncateMessages, extractMediaUrls, stripMediaUrls } from './text';
+import { intFromEnv, timeoutFromEnv } from './env';
+import type { DirectToolDefinition } from './interface';
+import { ConfirmationManager } from './confirm';
+import { createLogger } from './logger';
+
+const log = createLogger('bot');
 
 const tokenOpenaiApi: string = process.env.TOKEN_OPENAI_API ?? '';
 const tokenOpenaiAudioApi: string = process.env.TOKEN_OPENAI_AUDIO_API ?? tokenOpenaiApi;
@@ -14,17 +22,17 @@ const modelApiAudioOpenai: string = process.env.MODEL_API_AUDIO_OPENAI ?? '';
 const audioLanguage: string = process.env.AUDIO_LANGUAGE ?? 'en';
 const modelApiOpenai: string = process.env.MODEL_API_OPENAI ?? 'gpt-4o';
 const modelSupportsImage: boolean = process.env.MODEL_SUPPORTS_IMAGE === 'true';
-const limitTokensOpenai: number = parseInt(process.env.LIMIT_TOKENS_OPENAI ?? '2000');
-const limitFetch: number = parseInt(process.env.LIMIT_FETCH ?? '3');
-const limitTime: number = parseInt(process.env.LIMIT_TIME ?? '5') * 1000;
-const limitTools: number = parseInt(process.env.LIMIT_TOOLS ?? '10');
+const limitTokensOpenai: number = intFromEnv('LIMIT_TOKENS_OPENAI', 2000);
+const limitFetch: number = intFromEnv('LIMIT_FETCH', 3);
+const limitTime: number = timeoutFromEnv('LIMIT_TIME', 5);
+const limitTools: number = intFromEnv('LIMIT_TOOLS', 10);
 // Max length for tool results sent back to the LLM to prevent context window overflow
-const maxToolResultLength: number = parseInt(process.env.MAX_TOOL_RESULT_LENGTH ?? '8000');
-const sandboxTimeoutMs: number = parseInt(process.env.SANDBOX_TIMEOUT ?? '30') * 1000;
+const maxToolResultLength: number = intFromEnv('MAX_TOOL_RESULT_LENGTH', 8000);
+const sandboxTimeoutMs: number = timeoutFromEnv('SANDBOX_TIMEOUT', 30);
 const adminUsers: string[] = (process.env.ADMIN_USERS ?? '').split(/,\s*/).map(u => u.trim()).filter(u => u.length > 0);
 // Max estimated tokens for the messages array. When exceeded, oldest non-system messages are dropped.
 // Default 120k leaves room for system prompt + tools + response in a 128k context window.
-const maxContextTokens: number = parseInt(process.env.MAX_CONTEXT_TOKENS ?? '120000');
+const maxContextTokens: number = intFromEnv('MAX_CONTEXT_TOKENS', 120000);
 
 interface PuppeteerConfig {
     args?: string[];
@@ -58,6 +66,9 @@ const sessions: Map<string, boolean> = new Map<string, boolean>();
 const testMode: boolean = process.env.TEST_MODE === 'true';
 const mcpClientManager = new MCPClientManager();
 const sandboxRunner = new SandboxRunner(mcpClientManager);
+// Enforces the confirmation of tool calls at the host level: the model cannot
+// skip it, the user has to approve the call in the chat.
+const confirmationManager = new ConfirmationManager();
 
 // Progressive discovery threshold: if total MCP tools <= this, load directly into LLM tools array.
 // If > threshold, use meta-tools (search_tools, get_tool_details, etc.) instead.
@@ -67,7 +78,8 @@ const PROGRESSIVE_DISCOVERY_THRESHOLD: number = parseInt(process.env.MCP_TOOL_TH
 // Stable tools mode: when true, always use call_tool wrapper (keeps tools array stable for prompt caching)
 // When false, uses direct loading when below threshold (current behavior)
 // Per MCP best practices: "Append newly discovered definitions after the cache breakpoint rather than re-sorting the tools array"
-const STABLE_TOOLS_MODE: boolean = process.env.MCP_STABLE_TOOLS === 'true';
+// Default: true — preserves prompt cache by keeping the tools array stable across requests
+const STABLE_TOOLS_MODE: boolean = process.env.MCP_STABLE_TOOLS !== 'false';
 // null = not yet evaluated, true = direct loading, false = progressive discovery
 let useDirectLoading: boolean | null = null;
 // Promise to protect against race conditions during progressive discovery evaluation
@@ -80,7 +92,28 @@ const client = new Client({
     })
 });
 
+// Routes the tool calls requested by the model and applies the confirmation policy.
+const toolDispatcher = new ToolDispatcher(
+    mcpClientManager,
+    sandboxRunner,
+    confirmationManager,
+    async (to: string, text: string) => { await client.sendMessage(to, text); },
+    { sandboxTimeoutMs: sandboxTimeoutMs, maxToolResultLength: maxToolResultLength }
+);
+
 const tools: DirectToolDefinition[] = [
+    {
+        type: 'function',
+        function: {
+            name: 'search_available_servers',
+            description: 'List all available MCP servers, their status (connected/disconnected), and how many tools each provides. Use this FIRST to discover which servers are available before searching for tools.',
+            parameters: {
+                type: 'object',
+                properties: {},
+                required: []
+            }
+        }
+    },
     {
         type: 'function',
         function: {
@@ -134,6 +167,86 @@ const tools: DirectToolDefinition[] = [
                     }
                 },
                 required: ['serverName', 'toolName']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'list_resources',
+            description: 'List the resources exposed by the MCP servers. Optionally restrict the search to one server.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    serverName: {
+                        type: 'string',
+                        description: 'Name of the MCP server. Leave it empty to query every enabled server.'
+                    }
+                },
+                required: []
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'read_resource',
+            description: 'Read the content of a resource exposed by an MCP server, identified by its URI.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    serverName: {
+                        type: 'string',
+                        description: 'Name of the MCP server that exposes the resource'
+                    },
+                    uri: {
+                        type: 'string',
+                        description: 'URI of the resource to read'
+                    }
+                },
+                required: ['serverName', 'uri']
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'list_prompts',
+            description: 'List the prompts exposed by the MCP servers. Optionally restrict the search to one server.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    serverName: {
+                        type: 'string',
+                        description: 'Name of the MCP server. Leave it empty to query every enabled server.'
+                    }
+                },
+                required: []
+            }
+        }
+    },
+    {
+        type: 'function',
+        function: {
+            name: 'get_prompt',
+            description: 'Get a prompt of an MCP server with its rendered messages, providing the arguments it needs.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    serverName: {
+                        type: 'string',
+                        description: 'Name of the MCP server that exposes the prompt'
+                    },
+                    name: {
+                        type: 'string',
+                        description: 'Name of the prompt'
+                    },
+                    arguments: {
+                        type: 'object',
+                        description: 'Values of the arguments declared by the prompt'
+                    }
+                },
+                required: ['serverName', 'name']
             }
         }
     },
@@ -225,18 +338,6 @@ const tools: DirectToolDefinition[] = [
                 required: ['code']
             }
         }
-    },
-    {
-        type: 'function',
-        function: {
-            name: 'search_available_servers',
-            description: 'List all available MCP servers, their status (connected/disconnected), and how many tools each provides. Use this to discover which servers are available before connecting to them.',
-            parameters: {
-                type: 'object',
-                properties: {},
-                required: []
-            }
-        }
     }
 ];
 const adminTools: DirectToolDefinition[] = [
@@ -269,74 +370,14 @@ const adminTools: DirectToolDefinition[] = [
 
 const instructionsFile: string = (process.env.INSTRUCTIONS !== undefined) ? process.env.INSTRUCTIONS : 'instructions.txt';
 const instructionsFileContent: string = existsSync(instructionsFile) ? readFileSync(instructionsFile, 'utf8') : '';
-const instructions: string = ((instructionsFileContent !== '') ? instructionsFileContent : 'You are an assistant') + `
+const confirmationInstructions: string = `
 \n\nCONFIRMATION INSTRUCTIONS:\n
-- Do NOT use 'functions' unless the client confirms or says EXPLICITLY: 'yes I confirm', 'I want to confirm' or similar\n
-- ALWAYS ask: 'Do you want to confirm?' before using the function.\n`;
-
-/**
- * Truncate tool result to prevent context window overflow.
- * Uses structural-aware truncation when possible.
- */
-const truncateToolResult = (result: string, maxLength: number = maxToolResultLength): string =>
-    truncateResult(result, maxLength);
-
-/**
- * Smart truncation that preserves JSON structure when possible.
- * For plain text: truncates at word boundary with ellipsis.
- * For JSON: pretty-prints and truncates with structural hint.
- */
-const truncateResult = (result: string, maxLength: number): string => {
-    if (!result || result.length <= maxLength) return result;
-
-    // Try to parse as JSON
-    try {
-        const parsed = JSON.parse(result);
-        const pretty = JSON.stringify(parsed, null, 2);
-
-        if (pretty.length <= maxLength) return pretty;
-
-        // For objects/arrays, provide a structural summary when truncating
-        if (Array.isArray(parsed)) {
-            const summary = `Array[${parsed.length} items]`;
-            if (summary.length >= maxLength - 20) {
-                return result.substring(0, maxLength) + '...';
-            }
-            const slice = pretty.substring(0, maxLength - summary.length - 20);
-            // Try to find a clean break point (end of a property or item)
-            const lastComma = slice.lastIndexOf(',');
-            const lastBrace = slice.lastIndexOf('}');
-            const lastBracket = slice.lastIndexOf(']');
-            const breakPoint = Math.max(lastComma, lastBrace, lastBracket);
-            const cleanSlice = breakPoint > maxLength * 0.5 ? slice.substring(0, breakPoint + 1) : slice;
-            return cleanSlice + `\n... ${summary}]`;
-        }
-
-        if (typeof parsed === 'object' && parsed !== null) {
-            const keys = Object.keys(parsed);
-            const summary = `Object{${keys.slice(0, 5).join(', ')}${keys.length > 5 ? ', ...' : ''}}`;
-            if (summary.length >= maxLength - 20) {
-                return result.substring(0, maxLength) + '...';
-            }
-            const slice = pretty.substring(0, maxLength - summary.length - 20);
-            const lastComma = slice.lastIndexOf(',');
-            const lastBrace = slice.lastIndexOf('}');
-            const breakPoint = Math.max(lastComma, lastBrace);
-            const cleanSlice = breakPoint > maxLength * 0.5 ? slice.substring(0, breakPoint + 1) : slice;
-            return cleanSlice + `\n... ${summary}`;
-        }
-    } catch {
-        // Not JSON, fall through to plain text truncation
-    }
-
-    // Plain text: truncate at word boundary
-    const slice = result.substring(0, maxLength);
-    const lastSpace = slice.lastIndexOf(' ');
-    if (lastSpace > maxLength * 0.6) {
-        return slice.substring(0, lastSpace) + '...';
-    }
-    return slice + '...';
-};
+- ${confirmationManager.enabled
+        ? 'The host asks the user for confirmation before executing a tool that requires it.'
+        : 'The host executes the tools directly, without asking the user for confirmation.'}\n
+- Do NOT ask for confirmation yourself: the host owns that flow.\n
+- The result of a rejected or expired confirmation is returned to you as a tool result: explain it to the user and do not retry.\n`;
+const instructions: string = ((instructionsFileContent !== '') ? instructionsFileContent : 'You are an assistant') + confirmationInstructions;
 
 /**
  * Safely stringify an unknown error into a string message.
@@ -344,56 +385,6 @@ const truncateResult = (result: string, maxLength: number): string => {
  */
 const errMsg = (e: unknown): string =>
     e instanceof Error ? e.message : String(e);
-
-/**
- * Extract readable text from an MCP tool call result.
- * Handles text, image, audio, and resource content types.
- * Falls back to JSON serialization when no text content is found.
- */
-const extractMcpResultText = (result: any): string => {
-    let textContent = '';
-    if (result && result.content && Array.isArray(result.content)) {
-        for (const content of result.content) {
-            if (content.type === 'text') {
-                textContent += content.text + '\n';
-            } else if (content.type === 'image' || content.type === 'audio') {
-                textContent += `[${content.type} content not displayed in text chat]\n`;
-            } else if (content.type === 'resource') {
-                const res = content.resource as any;
-                textContent += `[Resource: ${res.uri || 'unknown'}]\n`;
-            }
-        }
-    }
-    textContent = textContent.trimEnd();
-    if (textContent === '') {
-        textContent = JSON.stringify(result);
-    }
-    return textContent;
-};
-
-const resetHistoryWithMessage = (user: string, successMsg: string, errorPrefix: string): string => {
-    try {
-        if (!resetHistory(user)) throw new Error(errorPrefix);
-        return successMsg;
-    } catch (error: any) {
-        return error.message;
-    }
-};
-
-const cleanCurrentChat = async (user: string) =>
-    resetHistoryWithMessage(user, 'Message history cleared successfully', 'Error clearing message history');
-
-const cleanChat = async (user: string) =>
-    resetHistoryWithMessage(user, 'Message history for ' + user + ' cleared successfully', 'Error clearing message history for ' + user);
-
-const cleanAllChats = async () => {
-    try {
-        if (!resetAllHistory()) throw new Error('Error clearing all message history');
-        return 'All message history cleared successfully';
-    } catch (error: any) {
-        return error.message;
-    }
-};
 
 const RETRYABLE_ERROR_PATTERNS = [
     'Rate limit reached',
@@ -450,91 +441,49 @@ const toIsoString = (date: Date) => {
 }
 
 /**
- * Rough token estimation: ~4 chars per token for English, ~2 for CJK.
- * Good enough for truncation decisions; not for billing.
+ * Placeholders shipped in `.env.example`. A key that still contains one of
+ * them is not a real credential: the bot would start and fail on every
+ * message, so it is rejected at startup instead.
  */
-const estimateTokens = (text: string): number => {
-    return Math.ceil(text.length / 4);
-};
+const API_KEY_PLACEHOLDERS = ['your_openai_api_key_here', 'your_openai_audio_api_key_here', 'changeme', 'change_me'];
 
 /**
- * Estimate tokens for a single message object.
+ * Validate the configuration needed to run the bot.
+ * Fails fast with an explicit message instead of surfacing a generic error per message.
  */
-const estimateMessageTokens = (msg: any): number => {
-    if (typeof msg.content === 'string') {
-        return estimateTokens(msg.content);
+const validateStartupConfiguration = (): void => {
+    const apiKey = tokenOpenaiApi.trim();
+    if (apiKey === '') {
+        throw new Error('TOKEN_OPENAI_API is not set. Copy .env.example to .env and provide your OpenAI API key.');
     }
-    if (Array.isArray(msg.content)) {
-        return msg.content.reduce((sum: number, part: any) => {
-            if (part.type === 'text') return sum + estimateTokens(part.text);
-            if (part.type === 'image_url') return sum + 1000; // rough estimate for images
-            return sum;
-        }, 0);
+    if (API_KEY_PLACEHOLDERS.some(placeholder => apiKey.toLowerCase().includes(placeholder))) {
+        throw new Error('TOKEN_OPENAI_API still contains the placeholder from .env.example. Put a real OpenAI API key in .env.');
     }
-    // tool_calls in assistant messages
-    if (msg.tool_calls) {
-        return msg.tool_calls.reduce((sum: number, tc: any) => {
-            return sum + estimateTokens(tc.function?.name ?? '') + estimateTokens(tc.function?.arguments ?? '');
-        }, 0);
+    if (browser !== '' && !existsSync(browser)) {
+        throw new Error(`BROWSER points to a browser executable that does not exist: ${browser}`);
     }
-    return 0;
+    if (modelApiAudioOpenai.trim() === '' || urlBaseOpenaiAudioApi.trim() === '') {
+        log.warn('Audio transcription is not configured (MODEL_API_AUDIO_OPENAI / URL_BASE_OPENAI_AUDIO_API): audio messages will fail');
+    }
 };
 
-/**
- * Truncate messages array to fit within token budget.
- * Keeps system message (index 0) and drops oldest non-system messages first.
- * Never drops tool results that are referenced by pending assistant tool_calls.
- */
-const truncateMessages = (messages: any[], maxTokens: number): any[] => {
-    let totalTokens = messages.reduce((sum, msg) => sum + estimateMessageTokens(msg), 0);
-    if (totalTokens <= maxTokens) return messages;
-
-    // Always keep the system message (index 0)
-    const systemMsg = messages[0];
-    const rest = messages.slice(1);
-
-    // Find the oldest messages we can safely drop
-    // We cannot drop a tool result if its tool_call_id is referenced by a newer assistant message
-    // Build a set of all tool_call_ids that appear in assistant messages
-    const referencedToolCallIds = new Set<string>();
-    for (const msg of rest) {
-        if (msg.tool_calls) {
-            for (const tc of msg.tool_calls) {
-                referencedToolCallIds.add(tc.id);
-            }
-        }
-    }
-
-    // Drop from the front, but skip tool results that are still referenced
-    let dropIndex = 0;
-    while (dropIndex < rest.length && totalTokens > maxTokens) {
-        const msg = rest[dropIndex];
-        // Skip if this is a tool result referenced by a later assistant message
-        if (msg.role === 'tool' && msg.tool_call_id && referencedToolCallIds.has(msg.tool_call_id)) {
-            dropIndex++;
-            continue;
-        }
-        totalTokens -= estimateMessageTokens(msg);
-        dropIndex++;
-    }
-
-    const truncated = [systemMsg, ...rest.slice(dropIndex)];
-    if (dropIndex > 0) {
-        console.log(`Truncated messages: dropped ${dropIndex} entries, ~${totalTokens} tokens remaining`);
-    }
-    return truncated;
-};
+try {
+    validateStartupConfiguration();
+} catch (error: any) {
+    log.error('Invalid configuration', { error: error?.message ?? error });
+    process.exit(1);
+}
 
 client.once('ready', async () => {
-    console.log('The Bot is ready!');
+    log.info('The Bot is ready!');
     try {
         await mcpClientManager.initialize();
-        console.log('MCP clients initialized');
+        log.info('MCP clients initialized');
 
         // Defer progressive discovery evaluation to first message (lazy)
         // to avoid connecting all servers on startup
     } catch (error: any) {
-        console.error('Failed to initialize MCP clients:', error);
+        log.error('Failed to initialize MCP clients', { error });
     }
 });
 
@@ -542,21 +491,74 @@ client.on('qr', (qr: string) => {
     qrcode.generate(qr, { small: true });
 });
 
+client.on('auth_failure', (message: any) => {
+    log.error('WhatsApp authentication failed', { message });
+});
+
+client.on('disconnected', (reason: any) => {
+    log.warn('WhatsApp client disconnected', { reason });
+});
+
+client.on('reconnected', () => {
+    log.info('WhatsApp client reconnected');
+});
+
 client.on('message_create', async (message: Message) => {
     const messageText: string = message.body.trim();
+    // Cheap filters first: the media of an ignored message is never downloaded
+    if (!testMode && message.fromMe) return;
+    if (message.isStatus) return;
+    if (message.to === message.from) return;
+    const currentChat: Chat = await message.getChat();
+    if (currentChat.isGroup) return;
+
     let media: MessageMedia | null = null;
     if (message.hasMedia) {
         try {
             media = await message.downloadMedia();
         } catch (downloadError: any) {
-            console.error('Failed to download media:', downloadError);
+            log.error('Failed to download media', { error: downloadError });
             return;
         }
     }
-    const currentChat: Chat = await message.getChat();
-    if ((!testMode && message.fromMe) || currentChat.isGroup || message.isStatus || (message.to === message.from) || (!media && messageText === '')) return;
+    if (!media && messageText === '') return;
     const contact: any = await client.getContactLidAndPhone([message.from]);
     const user: string = contact?.[0]?.pn ?? message.from.split('@')[0];
+
+    // A pending tool confirmation is answered by the next message of the user.
+    // It is handled before the session guard because the tool call that is
+    // waiting for the answer still holds the session.
+    if (confirmationManager.hasPending(user)) {
+        const outcome = confirmationManager.resolve(user, messageText);
+        if (outcome) {
+            await client.sendMessage(message.from, outcome === 'approved'
+                ? 'Confirmed. Executing the tool.'
+                : 'Cancelled. The tool will not be executed.');
+            return;
+        }
+        await client.sendMessage(message.from, 'I did not understand the answer. Reply "yes" to execute the tool or "no" to cancel it.');
+        return;
+    }
+
+    // Admin command to finish an interactive OAuth authorization:
+    //   /oauth <serverName> <authorizationCode>
+    if (adminUsers.includes(user) && messageText.startsWith('/oauth ')) {
+        const parts = messageText.slice('/oauth '.length).trim().split(/\s+/);
+        const serverName = parts[0] ?? '';
+        const code = parts.slice(1).join(' ');
+        if (!serverName || !code) {
+            await client.sendMessage(message.from, 'Usage: /oauth <serverName> <authorizationCode>');
+            return;
+        }
+        try {
+            await mcpClientManager.completeAuthorization(serverName, code);
+            await client.sendMessage(message.from, `Authorization completed for "${serverName}". The next tool call will reconnect the server.`);
+        } catch (error) {
+            await client.sendMessage(message.from, `Could not complete the authorization of "${serverName}": ${errMsg(error)}`);
+        }
+        return;
+    }
+
     const currentSession: boolean = sessions.get(user) ?? false;
     try {
         if (currentSession) throw new Error('Responding to previous message. Please wait before sending a new message');
@@ -564,25 +566,9 @@ client.on('message_create', async (message: Message) => {
         if (media && !(media.mimetype.startsWith('audio/') || media.mimetype.startsWith('image/'))) throw new Error('Unsupported attachment, only images and audio in flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav, or webm format are accepted');
         const userHistory: any[] = loadHistory(user);
         const messages: any[] = [{ role: 'system', content: instructions + 'The current user is ' + user + " \n\n" + 'The current date in ISO String format is ' + toIsoString((new Date())) + "\n\n" + 'NEVER show the ID field to the user as it is sensitive information' + "\n\n" }];
-        for (const entry of userHistory) {
-            if (entry.role === 'tool') {
-                messages.push({ role: 'tool', content: entry.text_content, tool_call_id: entry.tool_call_id, name: entry.function_name });
-            } else if (entry.role === 'assistant' && entry.function_name) {
-                // function_name holds JSON.stringify(tool_calls) for assistant messages that invoked tools
-                try {
-                    const toolCalls = JSON.parse(entry.function_name);
-                    const msg: any = { role: 'assistant' };
-                    if (entry.text_content) msg.content = entry.text_content;
-                    if (Array.isArray(toolCalls) && toolCalls.length > 0) msg.tool_calls = toolCalls;
-                    messages.push(msg);
-                } catch {
-                    if (entry.text_content) messages.push({ role: 'assistant', content: entry.text_content });
-                }
-            } else {
-                if (entry.text_content) messages.push({ role: entry.role, content: entry.text_content });
-            }
-        }
+        messages.push(...reconstructHistory(userHistory));
         const content: any[] = [];
+        let imageNotSupported = false;
         if (messageText !== '') {
             content.push({
                 type: 'text',
@@ -627,13 +613,24 @@ client.on('message_create', async (message: Message) => {
                 text: audioData.text
             });
             saveHistory(user, 'user', audioData.text, '', '');
-        } else if (media && media.mimetype.startsWith('image/') && modelSupportsImage) {
-            content.push({
-                type: 'image_url',
-                image_url: {
-                    url: 'data:' + media.mimetype + ';base64,' + media.data
-                }
-            });
+        } else if (media && media.mimetype.startsWith('image/')) {
+            if (modelSupportsImage) {
+                content.push({
+                    type: 'image_url',
+                    image_url: {
+                        url: 'data:' + media.mimetype + ';base64,' + media.data
+                    }
+                });
+            } else {
+                // The image cannot be forwarded to the model: the user is told instead of
+                // having the message silently dropped.
+                log.info('Image received but the configured model does not support images', { user });
+                imageNotSupported = true;
+            }
+        }
+        if (imageNotSupported) {
+            await client.sendMessage(message.from,
+                'The configured model cannot process images. Please describe the image in text or send it again as text.');
         }
         if (content.length === 0) return;
         messages.push({ role: 'user', content });
@@ -646,7 +643,7 @@ client.on('message_create', async (message: Message) => {
             if (STABLE_TOOLS_MODE) {
                 // Stable tools mode: always use call_tool wrapper for prompt caching optimization
                 useDirectLoading = false;
-                console.log('Progressive discovery: STABLE MODE (always using call_tool wrapper for prompt caching)');
+                log.info('Progressive discovery: STABLE MODE (always using call_tool wrapper for prompt caching)');
             } else if (discoveryEvaluationPromise) {
                 // Another message is already evaluating, wait for it
                 useDirectLoading = await discoveryEvaluationPromise;
@@ -657,9 +654,9 @@ client.on('message_create', async (message: Message) => {
                         const toolCount = await mcpClientManager.getToolCount();
                         const directLoading = toolCount <= PROGRESSIVE_DISCOVERY_THRESHOLD;
                         if (directLoading) {
-                            console.log(`Progressive discovery: OFF (tool count ${toolCount} <= threshold ${PROGRESSIVE_DISCOVERY_THRESHOLD}, loading directly)`);
+                            log.info(`Progressive discovery: OFF (tool count ${toolCount} <= threshold ${PROGRESSIVE_DISCOVERY_THRESHOLD}, loading directly)`);
                         } else {
-                            console.log(`Progressive discovery: ON (tool count ${toolCount} > threshold ${PROGRESSIVE_DISCOVERY_THRESHOLD}, using search meta-tools)`);
+                            log.info(`Progressive discovery: ON (tool count ${toolCount} > threshold ${PROGRESSIVE_DISCOVERY_THRESHOLD}, using search meta-tools)`);
                         }
                         return directLoading;
                     } finally {
@@ -672,22 +669,32 @@ client.on('message_create', async (message: Message) => {
 
         // Progressive discovery: if threshold not reached, load MCP tools directly
         let finalTools: DirectToolDefinition[] = currentTools;
+        // Track which servers have tools in the active LLM context (for idle disconnect protection)
+        const contextServerNames = new Set<string>();
         if (useDirectLoading === true) {
             try {
                 const directMcpTools = await mcpClientManager.getAllToolsForDirectLoading();
                 if (directMcpTools.length > 0) {
-                    // Sort by tool name for deterministic ordering (prompt caching optimization)
-                    // Per MCP best practices: "Append newly discovered definitions after the cache breakpoint"
-                    directMcpTools.sort((a, b) => a.function.name.localeCompare(b.function.name));
-                    // Merge: built-in tools first, then MCP tools in stable order
+                    // Per MCP best practices: "Append newly discovered definitions after the cache breakpoint rather than re-sorting the tools array"
+                    // Tools are already in stable order: built-in tools first, then MCP tools grouped by server config order
+                    // with tools sorted within each server block (handled by getAllToolsForDirectLoading).
+                    // Do NOT sort the merged array — it would shift tools across server boundaries and invalidate prompt cache.
                     finalTools = [...currentTools, ...directMcpTools];
-                    if (testMode) console.log(`Loaded ${directMcpTools.length} MCP tools directly (below threshold)`);
+                    // Extract unique server names from MCP tools for idle-disconnect protection
+                    for (const tool of directMcpTools) {
+                        const parsed = MCPClientManager.parseToolName(tool.function.name);
+                        if (parsed) contextServerNames.add(parsed.serverName);
+                    }
+                    if (testMode) log.info(`Loaded ${directMcpTools.length} MCP tools directly (below threshold)`);
                 }
             } catch (error) {
-                console.error('Error loading MCP tools for direct loading, falling back to meta-tools:', error);
+                log.error('Error loading MCP tools for direct loading, falling back to meta-tools', { error });
                 // Keep using meta-tools as fallback
             }
         }
+        // Pin/unpin servers: servers with tools in the LLM context won't be disconnected by idle cleanup
+        // This preserves prompt cache across conversation pauses (per MCP best practices)
+        mcpClientManager.setActiveContextServers(contextServerNames);
 
         let currentIteration: number = 0,
             finalResponseContent: string | null = null;
@@ -716,7 +723,12 @@ client.on('message_create', async (message: Message) => {
                         max_completion_tokens: limitTokensOpenai
                     })
                 });
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                if (!response.ok) {
+                    let errorBody = '';
+                    try { errorBody = await response.text(); } catch { }
+                    const detail = errorBody ? `: ${errorBody.substring(0, 200)}` : '';
+                    throw new Error(`HTTP ${response.status}${detail}`);
+                }
                 data = await response.json();
                 if (!data || (data.error && data.error.message && data.error.message.startsWith('Rate limit reached for model'))) {
                     throw new Error(data?.error?.message ?? 'Rate limit reached');
@@ -763,217 +775,11 @@ client.on('message_create', async (message: Message) => {
                     continue;
                 }
 
-                // Handle search_tools function
-                if (functionName === 'search_tools') {
-                    try {
-                        const query = functionArgs?.query ?? '';
-                        const limit = functionArgs?.limit ?? 10;
-                        const detailLevel = functionArgs?.detailLevel ?? 'basic';
-                        const searchResults = await mcpClientManager.searchTools(query, limit, detailLevel);
-
-                        // Format results for the LLM using the new delimiter
-                        let resultText = 'Search results:\n';
-                        if (searchResults.length === 0) {
-                            resultText += 'No tools found matching the query.';
-                        } else {
-                            for (const result of searchResults) {
-                                if (detailLevel === 'minimal') {
-                                    // Minimal: just the full name
-                                    resultText += `- ${MCPClientManager.getFullToolName(result.serverName, result.toolName)}\n`;
-                                } else if (detailLevel === 'full') {
-                                    // Full: include schemas
-                                    resultText += `- ${MCPClientManager.getFullToolName(result.serverName, result.toolName)}: ${result.description}\n`;
-                                    if (result.inputSchema) {
-                                        resultText += `  Input Schema: ${JSON.stringify(result.inputSchema)}\n`;
-                                    }
-                                    if (result.outputSchema) {
-                                        resultText += `  Output Schema: ${JSON.stringify(result.outputSchema)}\n`;
-                                    }
-                                } else {
-                                    // Basic: name + description
-                                    resultText += `- ${MCPClientManager.getFullToolName(result.serverName, result.toolName)}: ${result.description}\n`;
-                                }
-                            }
-                        }
-                        functionResponse = resultText;
-                    } catch (error) {
-                        functionResponse = `Error searching tools: ${errMsg(error)}`;
-                    }
-                }
-                // Handle search_available_servers function
-                else if (functionName === 'search_available_servers') {
-                    try {
-                        const servers = await mcpClientManager.getAvailableServers();
-                        let resultText = 'Available MCP servers:\n';
-                        if (servers.length === 0) {
-                            resultText += 'No MCP servers configured.';
-                        } else {
-                            for (const server of servers) {
-                                const status = server.connected ? 'connected' : 'disconnected';
-                                resultText += `- ${server.name} [${status}]: ${server.description} (${server.toolCount} tools, ${server.type})\n`;
-                            }
-                        }
-                        functionResponse = resultText;
-                    } catch (error) {
-                        functionResponse = `Error listing servers: ${errMsg(error)}`;
-                    }
-                }
-                // Handle get_tool_details function
-                else if (functionName === 'get_tool_details') {
-                    try {
-                        const serverName = functionArgs?.serverName;
-                        const toolName = functionArgs?.toolName;
-                        if (!serverName || !toolName) {
-                            functionResponse = 'Error: serverName and toolName are required';
-                        } else {
-                            const toolDetails = await mcpClientManager.getToolDetails(serverName, toolName);
-                            // Format the tool details for the LLM
-                            let resultText = `Tool Details:\n`;
-                            resultText += `Server: ${serverName}\n`;
-                            resultText += `Name: ${toolDetails.name}\n`;
-                            resultText += `Full Name: ${MCPClientManager.getFullToolName(serverName, toolDetails.name)}\n`;
-                            resultText += `Description: ${toolDetails.description || 'No description available'}\n`;
-                            if (toolDetails.inputSchema) {
-                                resultText += `Input Schema: ${JSON.stringify(toolDetails.inputSchema, null, 2)}\n`;
-                            } else {
-                                resultText += `Input Schema: Not available\n`;
-                            }
-                            if (toolDetails.outputSchema) {
-                                resultText += `Output Schema: ${JSON.stringify(toolDetails.outputSchema, null, 2)}\n`;
-                            } else {
-                                resultText += `Output Schema: Not available\n`;
-                            }
-                            functionResponse = resultText;
-                        }
-                    } catch (error) {
-                        functionResponse = `Error getting tool details: ${errMsg(error)}`;
-                    }
-                }
-                // Handle call_tool function (single tool call via stable wrapper)
-                // This keeps the LLM tools array stable for prompt caching optimization
-                else if (functionName === 'call_tool') {
-                    try {
-                        const serverName = functionArgs?.serverName;
-                        const toolName = functionArgs?.toolName;
-                        const args = functionArgs?.args ?? {};
-                        if (!serverName || !toolName) {
-                            functionResponse = 'Error: serverName and toolName are required';
-                        } else {
-                            const result = await mcpClientManager.callTool(serverName, toolName, args);
-                            functionResponse = truncateToolResult(extractMcpResultText(result));
-                        }
-                    } catch (error) {
-                        const errorMessage = errMsg(error);
-                        functionResponse = `Error calling tool: ${errorMessage}`;
-                    }
-                }
-                // Handle execute_tool_sequence (sandboxed programmatic tool calling per MCP best practices)
-                // Runs steps in an isolated Bun subprocess with tool stubs.
-                // Only the final summary returns to the model, keeping intermediate results out of context.
-                else if (functionName === 'execute_tool_sequence') {
-                    try {
-                        const steps = functionArgs?.steps ?? [];
-                        const summaryPrompt = functionArgs?.summary ?? 'Summarize the results';
-
-                        // Validate max steps to prevent runaway execution
-                        const MAX_STEPS = 20;
-                        if (!Array.isArray(steps) || steps.length === 0) {
-                            functionResponse = 'Error: steps must be a non-empty array';
-                        } else if (steps.length > MAX_STEPS) {
-                            functionResponse = `Error: too many steps (${steps.length}). Maximum allowed is ${MAX_STEPS}`;
-                        } else {
-                            // Validate all steps upfront
-                            const validatedSteps: SandboxStep[] = [];
-                            for (let i = 0; i < steps.length; i++) {
-                                const step = steps[i];
-                                if (!step || typeof step !== 'object') {
-                                    validatedSteps.push({ index: i, serverName: '', toolName: '', args: {}, valid: false, error: 'step must be an object' });
-                                    continue;
-                                }
-                                const { serverName, toolName, args, saveAs, useResultFrom } = step;
-                                if (!serverName || !toolName) {
-                                    validatedSteps.push({ index: i, serverName: '', toolName: '', args: {}, valid: false, error: 'serverName and toolName are required' });
-                                    continue;
-                                }
-                                if (typeof serverName !== 'string' || typeof toolName !== 'string') {
-                                    validatedSteps.push({ index: i, serverName: '', toolName: '', args: {}, valid: false, error: 'serverName and toolName must be strings' });
-                                    continue;
-                                }
-                                if (saveAs && (typeof saveAs !== 'string' || saveAs === '__proto__' || saveAs === 'constructor' || saveAs === 'prototype')) {
-                                    validatedSteps.push({ index: i, serverName: '', toolName: '', args: {}, valid: false, error: 'invalid saveAs key' });
-                                    continue;
-                                }
-                                validatedSteps.push({ index: i, serverName, toolName, args: args ?? {}, saveAs, useResultFrom, valid: true });
-                            }
-
-                            // Get available tool stubs for the sandbox
-                            const toolStubs = await mcpClientManager.getToolsForSandbox();
-                            if (toolStubs.length === 0) {
-                                functionResponse = 'No MCP tools available. Connect to an MCP server first.';
-                            } else {
-                                // Execute in sandboxed subprocess â€” intermediate results stay isolated
-                                const result = await sandboxRunner.executeToolSequence(validatedSteps, toolStubs, sandboxTimeoutMs, summaryPrompt);
-                                functionResponse = formatSandboxResult(result);
-                            }
-                        }
-                    } catch (error) {
-                        functionResponse = `Error executing tool sequence: ${errMsg(error)}`;
-                    }
-                }
-                // Handle execute_code (sandboxed programmatic tool calling per MCP best practices)
-                // Runs model-generated code in an isolated Bun subprocess with tool stubs.
-                // Only console output returns to the model, keeping intermediate results out of context.
-                else if (functionName === 'execute_code') {
-                    try {
-                        const code = functionArgs?.code;
-                        if (!code || typeof code !== 'string') {
-                            functionResponse = 'Error: code must be a non-empty string';
-                        } else {
-                            // Get available tool stubs for the sandbox
-                            const toolStubs = await mcpClientManager.getToolsForSandbox();
-                            if (toolStubs.length === 0) {
-                                functionResponse = 'No MCP tools available for sandbox execution. Connect to an MCP server first.';
-                            } else {
-                                const result = await sandboxRunner.execute(code, toolStubs, sandboxTimeoutMs);
-                                functionResponse = formatSandboxResult(result);
-                            }
-                        }
-                    } catch (error) {
-                        functionResponse = `Error in sandbox execution: ${errMsg(error)}`;
-                    }
-                }
-                // Check if this is an MCP tool (using the __ delimiter)
-                else {
-                    const parsedTool = MCPClientManager.parseToolName(functionName);
-                    if (parsedTool) {
-                        const { serverName, toolName } = parsedTool;
-                        try {
-                            // callTool handles ensureServerConnected and isError->throw internally
-                            const result = await mcpClientManager.callTool(serverName, toolName, functionArgs);
-                            functionResponse = truncateToolResult(extractMcpResultText(result));
-                        } catch (error) {
-                            // Transport errors AND MCP tool errors (isError: true) both end up here
-                            const errorMessage = errMsg(error);
-                            functionResponse = `Error calling MCP tool ${toolName}: ${errorMessage}`;
-                        }
-                    } else {
-                        // Handle regular (non-MCP) functions
-                        if (functionName === 'clean_current_chat') {
-                            functionResponse = await cleanCurrentChat(user);
-                        } else if (adminUsers.includes(user)) {
-                            if (functionName === 'clean_chat') {
-                                const targetUser = functionArgs?.user;
-                                if (!targetUser) {
-                                    functionResponse = 'Error: user parameter is required for clean_chat';
-                                } else {
-                                    functionResponse = await cleanChat(targetUser);
-                                }
-                            } else if (functionName === 'clean_all_chats') {
-                                functionResponse = await cleanAllChats();
-                            }
-                        }
-                    }
-                }
+                functionResponse = await toolDispatcher.dispatch(functionName, functionArgs, {
+                    user,
+                    to: message.from,
+                    isAdmin: adminUsers.includes(user)
+                });
 
                 const toolMessage = {
                     tool_call_id: toolCall.id,
@@ -986,21 +792,27 @@ client.on('message_create', async (message: Message) => {
                 saveHistory(user, 'tool', functionResponse, toolCall.id, functionName);
             }
         }
-        if (!finalResponseContent) finalResponseContent = 'Sorry, I could not complete your request after several attempts.';
-        const mediaUrls: any = finalResponseContent.match(/(https?:\/\/[^\s]+)/g);
-        if (mediaUrls && mediaUrls.length !== 0) {
-            finalResponseContent = finalResponseContent.replaceAll(/(https?:\/\/[^\s]+)/g, '').trim();
+        if (!finalResponseContent) finalResponseContent = 'Sorry, I could not complete your request. Please try again.';
+        // Only URLs pointing to a media file are sent as attachments; regular links stay in the text
+        const mediaUrls: string[] = extractMediaUrls(finalResponseContent);
+        if (mediaUrls.length !== 0) {
+            finalResponseContent = stripMediaUrls(finalResponseContent);
             if (finalResponseContent !== '') {
                 await client.sendMessage(message.from, finalResponseContent);
             }
             for (const mediaUrl of mediaUrls) {
-                await client.sendMessage(message.from, (await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true })));
+                try {
+                    await client.sendMessage(message.from, (await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true })));
+                } catch (mediaError: any) {
+                    log.error('Failed to send media', { url: mediaUrl, error: mediaError });
+                    await client.sendMessage(message.from, mediaUrl);
+                }
             }
         } else {
             await client.sendMessage(message.from, finalResponseContent);
         }
     } catch (error: any) {
-        console.error(`Error for user ${user}:`, error);
+        log.error('Error while processing a message', { user, error });
         saveHistory(user, 'assistant', 'An error occurred processing your request. Please try again.', '', '');
         await client.sendMessage(message.from, 'An error occurred processing your request. Please try again.');
     } finally {
@@ -1009,14 +821,19 @@ client.on('message_create', async (message: Message) => {
     }
 });
 
-client.initialize();
+client.initialize().catch(async (error: any) => {
+    log.error('Failed to initialize the WhatsApp client', { error: error?.message ?? error });
+    await mcpClientManager.disconnectAll().catch(() => { });
+    closeDatabase();
+    process.exit(1);
+});
 
 // Graceful shutdown: disconnect MCP servers and close database on process exit
 let isShuttingDown = false;
 const shutdown = async () => {
     if (isShuttingDown) return;
     isShuttingDown = true;
-    console.log('\nShutting down, disconnecting MCP servers and closing database...');
+    log.info('Shutting down, disconnecting MCP servers and closing database...');
     await mcpClientManager.disconnectAll();
     closeDatabase();
     process.exit(0);
@@ -1033,14 +850,14 @@ process.on('beforeExit', () => {
 // Handle unhandled errors: ensure MCP servers are disconnected and DB is closed
 // Per MCP best practices: "Handle server disconnections" and proper resource cleanup
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+    log.error('Unhandled Rejection', { promise, reason });
     if (!isShuttingDown) {
         mcpClientManager.disconnectAll().catch(() => { });
         closeDatabase();
     }
 });
 process.on('uncaughtException', (error) => {
-    console.error('Uncaught Exception:', error);
+    log.error('Uncaught Exception', { error });
     if (!isShuttingDown) {
         mcpClientManager.disconnectAll().catch(() => { });
         closeDatabase();
